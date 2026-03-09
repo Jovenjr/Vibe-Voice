@@ -1,5 +1,8 @@
 ﻿# Vibe Voice
 
+![CI](https://github.com/Jovenjr/Vibe-Voice/actions/workflows/ci.yml/badge.svg)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)
 Vibe Voice es una app local para visualizar en tiempo real respuestas de asistentes dentro de tu entorno de desarrollo y, además, ofrece utilidades opcionales de voz como TTS y dictado con Whisper.
 
 El proyecto incluye:
@@ -137,3 +140,4 @@ Ya se añadió un `.gitignore` orientado a publicación pública.
 
 Suggested GitHub metadata is available in .github/REPO_METADATA.md.
 Initial public release notes are available in .github/RELEASE_v0.1.0.md.
+
