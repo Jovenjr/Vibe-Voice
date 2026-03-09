@@ -1,11 +1,22 @@
 import os
 import re
+import sys
 
 # Examinar archivo .pb de Antigravity conversations
-pb_file = r'C:\Users\joven\.gemini\antigravity\conversations\68e6172b-e371-4362-9044-f7b2442a1e47.pb'
+# Uso: python check_windsurf.py <ruta_al_archivo.pb>
+if len(sys.argv) < 2:
+    print("Uso: python check_windsurf.py <ruta_al_archivo.pb>")
+    sys.exit(1)
 
-with open(pb_file, 'rb') as f:
-    data = f.read()
+pb_file = sys.argv[1]
+
+try:
+    with open(pb_file, 'rb') as f:
+        data = f.read()
+except (FileNotFoundError, PermissionError) as e:
+    print(f"Error: No se pudo abrir el archivo '{pb_file}'. Verifica la ruta e inténtalo de nuevo.")
+    print(f"Detalle: {e}")
+    sys.exit(1)
     
 print(f"Tamaño: {len(data)} bytes")
 print(f"\nPrimeros 300 bytes (hex + ascii):")
