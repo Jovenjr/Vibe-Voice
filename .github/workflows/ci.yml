@@ -1,0 +1,43 @@
+﻿name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate Python syntax
+        shell: bash
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          files = [
+              Path('server/database.py'),
+              Path('server/fastapi_app.py'),
+              Path('server/llm_processor.py'),
+              Path('server/telegram_input.py'),
+              Path('server/tts_engine.py'),
+          ]
+          optional = [Path('desktop_dictation.pyw'), Path('run_hidden.pyw')]
+          for path in files + optional:
+              if path.exists():
+                  ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+                  print(f'OK {path}')
+          PY
+
+      - name: Install server dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r server/requirements.txt

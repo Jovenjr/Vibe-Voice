@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vibe Voice</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="logo">⬡ Vibe Voice</span>
+      <div class="status-pill">
+        <span id="status-dot" class="status-dot disconnected"></span>
+        <span id="status-text" class="status-text">Desconectado</span>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span class="meta" title="Latencia">⚡ <span id="latency">–</span></span>
+      <span class="meta" title="Directorios monitoreados">📂 <span id="watching-count">–</span></span>
+      <span class="meta file-meta" title="Sesión activa">🗂 <span id="active-file">ninguno</span></span>
+      <button id="force-refresh-btn" class="btn-icon" title="Forzar actualización">🔄</button>
+      <button id="theme-toggle" class="btn-icon" title="Cambiar tema">🌙</button>
+      <button id="settings-btn" class="btn-icon" title="Configuración">⚙️</button>
+      <button id="reconnect-btn" class="btn-icon" title="Reconectar">↺</button>
+    </div>
+  </header>
+
+  <div class="layout">
+
+    <main class="chat-panel">
+      <div id="messages" class="messages"></div>
+    </main>
+
+    <aside class="sidebar">
+
+      <section class="card">
+        <h3 class="card-title">Conexión</h3>
+        <label class="field-label">WebSocket URL</label>
+        <input id="ws-url" type="text" class="input" placeholder="ws://localhost:8765" />
+      </section>
+
+      <section class="card">
+        <h3 class="card-title">IDE a monitorear</h3>
+        <select id="ide-selector" class="input">
+          <option value="all">Todos los IDEs</option>
+          <option value="vscode-insiders">VS Code Insiders</option>
+          <option value="vscode">VS Code</option>
+          <option value="cursor">Cursor</option>
+          <option value="codex">Codex CLI</option>
+        </select>
+        <p class="hint" id="ide-hint">Selecciona qué IDE monitorear</p>
+        
+        <label class="toggle-row" style="margin-top: 8px;">
+          <span>Incluir razonamiento</span>
+          <input id="include-thinking" type="checkbox" class="toggle" /><span class="track"></span>
+        </label>
+        <p class="hint">Solo aplica a Cursor (thinking del modelo)</p>
+      </section>
+
+      <section class="card">
+        <h3 class="card-title">Voz (TTS)</h3>
+
+        <label class="toggle-row">
+          <span>Activar TTS</span>
+          <input id="tts-enabled" type="checkbox" class="toggle" /><span class="track"></span>
+        </label>
+
+        <label class="field-label">Voz</label>
+        <select id="tts-voice" class="input">
+          <option value="0">Cargando…</option>
+        </select>
+
+        <label class="field-label">Velocidad: <span id="tts-rate-label">1.0x</span></label>
+        <input id="tts-rate" type="range" min="0.5" max="2.0" step="0.1" value="1.0" class="slider" />
+
+        <label class="toggle-row">
+          <span>Procesar con LLM</span>
+          <input id="tts-llm-enabled" type="checkbox" class="toggle" /><span class="track"></span>
+        </label>
+
+        <label class="toggle-row">
+          <span>Enviar a Telegram</span>
+          <input id="tts-telegram" type="checkbox" class="toggle" /><span class="track"></span>
+        </label>
+        <p class="hint" id="telegram-status"></p>
+
+        <label class="toggle-row">
+          <span>Recibir de Telegram</span>
+          <input id="telegram-input" type="checkbox" class="toggle" /><span class="track"></span>
+        </label>
+        <p class="hint" id="telegram-input-status"></p>
+
+        <div class="audio-controls">
+          <button id="tts-pause" class="btn-ctrl" title="Pausar">⏸</button>
+          <button id="tts-resume" class="btn-ctrl" title="Reanudar">▶</button>
+          <button id="tts-skip" class="btn-ctrl" title="Siguiente">⏭</button>
+          <button id="tts-stop" class="btn-ctrl btn-stop" title="Detener">⏹</button>
+        </div>
+        <p class="hint" id="audio-status">Listo</p>
+      </section>
+
+      <section class="card">
+        <h3 class="card-title">Vista</h3>
+
+        <label class="toggle-row">
+          <span>Auto-scroll</span>
+          <input id="auto-scroll" type="checkbox" class="toggle" checked /><span class="track"></span>
+        </label>
+
+        <label class="toggle-row">
+          <span>Timestamps</span>
+          <input id="show-timestamps" type="checkbox" class="toggle" /><span class="track"></span>
+        </label>
+
+        <button id="clear-messages" class="btn-danger">🗑 Limpiar chat</button>
+      </section>
+
+      <section class="card">
+        <h3 class="card-title">Historial</h3>
+        
+        <div class="search-box">
+          <input id="history-search" type="text" class="input" placeholder="Buscar en historial..." />
+          <button id="search-btn" class="btn-icon" title="Buscar">🔍</button>
+        </div>
+        
+        <div id="sessions-list" class="sessions-list">
+          <p class="hint">Cargando sesiones...</p>
+        </div>
+        
+        <div class="history-actions">
+          <button id="export-md" class="btn-small" title="Exportar Markdown">📄 MD</button>
+          <button id="export-json" class="btn-small" title="Exportar JSON">📋 JSON</button>
+          <button id="load-session" class="btn-small" title="Cargar sesión">📂 Cargar</button>
+        </div>
+        
+        <div class="db-stats">
+          <span id="db-stats-text" class="hint">Sesiones: - | Mensajes: -</span>
+        </div>
+      </section>
+
+    </aside>
+  </div>
+
+  <div id="toast-container"></div>
+
+  <!-- Modal de Configuración -->
+  <div id="settings-modal" class="modal hidden">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>⚙️ Configuración</h2>
+        <button id="close-settings" class="btn-icon">✕</button>
+      </div>
+      
+      <div class="modal-body">
+        <!-- Tabs -->
+        <div class="settings-tabs">
+          <button class="tab-btn active" data-tab="general">General</button>
+          <button class="tab-btn" data-tab="tts">Voz TTS</button>
+          <button class="tab-btn" data-tab="stt">Voz STT</button>
+          <button class="tab-btn" data-tab="telegram">Telegram</button>
+          <button class="tab-btn" data-tab="api">API Keys</button>
+        </div>
+
+        <!-- Tab: General -->
+        <div id="tab-general" class="tab-content active">
+          <div class="setting-group">
+            <label class="setting-label">Servidor WebSocket</label>
+            <input id="settings-ws-url" type="text" class="input" placeholder="ws://localhost:8765" />
+            <p class="hint">URL del servidor backend</p>
+          </div>
+          
+          <div class="setting-group">
+            <label class="setting-label">IDE a monitorear</label>
+            <select id="settings-ide" class="input">
+              <option value="all">Todos los IDEs</option>
+              <option value="cursor">Cursor</option>
+              <option value="vscode">VS Code</option>
+              <option value="vscode-insiders">VS Code Insiders</option>
+              <option value="codex">Codex CLI</option>
+            </select>
+          </div>
+
+          <div class="setting-group">
+            <label class="toggle-row">
+              <span>Incluir razonamiento (Cursor)</span>
+              <input id="settings-thinking" type="checkbox" class="toggle" /><span class="track"></span>
+            </label>
+          </div>
+
+          <div class="setting-group">
+            <label class="toggle-row">
+              <span>Incluir progreso visible (Codex)</span>
+              <input id="settings-codex-progress" type="checkbox" class="toggle" /><span class="track"></span>
+            </label>
+            <p class="hint">Lee también mensajes cortos de avance/comentary del agente de Codex</p>
+          </div>
+        </div>
+
+        <!-- Tab: TTS -->
+        <div id="tab-tts" class="tab-content">
+          <div class="setting-group">
+            <label class="setting-label">Voz</label>
+            <div class="voice-selector">
+              <select id="settings-tts-voice" class="input"></select>
+              <button id="preview-voice" class="btn-small">▶ Preview</button>
+            </div>
+            <p class="hint">Selecciona la voz para el Text-to-Speech</p>
+          </div>
+
+          <div class="setting-group">
+            <label class="setting-label">Velocidad: <span id="settings-rate-label">1.0x</span></label>
+            <input id="settings-tts-rate" type="range" min="0.5" max="2.0" step="0.1" value="1.0" class="slider" />
+          </div>
+
+          <div class="setting-group">
+            <label class="toggle-row">
+              <span>Activar TTS</span>
+              <input id="settings-tts-enabled" type="checkbox" class="toggle" /><span class="track"></span>
+            </label>
+          </div>
+
+          <div class="setting-group">
+            <label class="toggle-row">
+              <span>Procesar con LLM (resumir/limpiar)</span>
+              <input id="settings-llm-enabled" type="checkbox" class="toggle" /><span class="track"></span>
+            </label>
+            <p class="hint">Usa Gemini para resumir y limpiar el texto antes de leerlo</p>
+          </div>
+        </div>
+
+        <!-- Tab: STT -->
+        <div id="tab-stt" class="tab-content">
+          <div class="setting-group">
+            <label class="setting-label">Proveedor Speech-to-Text</label>
+            <select id="settings-stt-provider" class="input">
+              <option value="groq">Groq (Whisper v3, rápido)</option>
+              <option value="whisper_local">Whisper Local (gratis)</option>
+              <option value="gemini">Gemini (multimodal)</option>
+              <option value="google_cloud">Google Cloud STT</option>
+            </select>
+            <p class="hint" id="stt-provider-hint">Proveedor para transcribir notas de voz de Telegram</p>
+          </div>
+
+          <div class="setting-group" id="whisper-model-group">
+            <label class="setting-label">Modelo Whisper (solo local)</label>
+            <select id="settings-whisper-model" class="input">
+              <option value="tiny">Tiny (rápido, menos preciso)</option>
+              <option value="base">Base (equilibrado)</option>
+              <option value="small">Small (mejor calidad)</option>
+              <option value="medium">Medium (alta calidad)</option>
+              <option value="large">Large (máxima calidad)</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- Tab: Telegram -->
+        <div id="tab-telegram" class="tab-content">
+          <div class="setting-group">
+            <label class="setting-label">Bot Token</label>
+            <input id="settings-telegram-token" type="password" class="input" placeholder="123456:ABC-DEF..." />
+            <p class="hint">Token del bot de @BotFather</p>
+          </div>
+
+          <div class="setting-group">
+            <label class="setting-label">Chat ID</label>
+            <input id="settings-telegram-chat-id" type="text" class="input" placeholder="123456789" />
+            <p class="hint">Tu ID de chat (envía /start al bot y mira getUpdates)</p>
+          </div>
+
+          <div class="setting-group">
+            <label class="toggle-row">
+              <span>Enviar audios a Telegram</span>
+              <input id="settings-telegram-send" type="checkbox" class="toggle" /><span class="track"></span>
+            </label>
+          </div>
+
+          <div class="setting-group">
+            <label class="toggle-row">
+              <span>Recibir mensajes de Telegram</span>
+              <input id="settings-telegram-receive" type="checkbox" class="toggle" /><span class="track"></span>
+            </label>
+          </div>
+        </div>
+
+        <!-- Tab: API Keys -->
+        <div id="tab-api" class="tab-content">
+          <div class="setting-group">
+            <label class="setting-label">Gemini API Key</label>
+            <input id="settings-gemini-key" type="password" class="input" placeholder="AIza..." />
+            <p class="hint">Para LLM y transcripción con Gemini</p>
+          </div>
+
+          <div class="setting-group">
+            <label class="setting-label">Groq API Key</label>
+            <input id="settings-groq-key" type="password" class="input" placeholder="gsk_..." />
+            <p class="hint">Para transcripción rápida con Whisper v3</p>
+          </div>
+
+          <p class="hint" style="margin-top:12px;color:var(--yellow);">
+            ⚠️ Las API keys se guardan en el servidor. No las compartas.
+          </p>
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <button id="save-settings" class="btn-primary">💾 Guardar cambios</button>
+        <button id="cancel-settings" class="btn-secondary">Cancelar</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

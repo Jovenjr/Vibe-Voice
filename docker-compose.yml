@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  copilot-viewer:
+    build: .
+    container_name: copilot-realtime-viewer
+    ports:
+      - "8080:8080"   # UI HTTP
+      - "8765:8765"   # WebSocket
+    volumes:
+      # Montar archivos de VS Code/Cursor (solo lectura)
+      # Windows: usa /c/Users/... formato
+      - "${APPDATA_PATH:-/c/Users/${USERNAME}/AppData/Roaming}/Code - Insiders/User/workspaceStorage:/appdata/code-insiders/workspaceStorage:ro"
+      - "${APPDATA_PATH:-/c/Users/${USERNAME}/AppData/Roaming}/Code/User/workspaceStorage:/appdata/code/workspaceStorage:ro"
+      - "${APPDATA_PATH:-/c/Users/${USERNAME}/AppData/Roaming}/Cursor/User/workspaceStorage:/appdata/cursor/workspaceStorage:ro"
+      # Directorio para audio generado (compartido entre contenedor y host)
+      - ./audio_cache:/app/server/audio_cache
+    environment:
+      - DOCKER_MODE=1
+      - PYTHONUNBUFFERED=1
+      # Rutas dentro del contenedor
+      - APPDATA_OVERRIDE=/appdata
+    restart: unless-stopped
+    # Healthcheck para verificar que el servidor está corriendo
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
