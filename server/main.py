@@ -14,6 +14,7 @@ El servidor:
 """
 
 import asyncio
+import base64
 import json
 import argparse
 import logging
@@ -21,9 +22,12 @@ import sys
 import threading
 import http.server
 import socketserver
-from typing import Set, Optional
+from urllib.parse import urlparse, parse_qs
+from typing import Set, Optional, Any
 from pathlib import Path
 from functools import partial
+
+from platform_paths import get_codex_sessions_dir, get_copilot_session_state_dir, infer_ide_from_path
 
 # Forzar salida sin buffer para que la consola muestre logs en tiempo real
 if hasattr(sys.stdout, 'reconfigure'):
@@ -36,6 +40,9 @@ if hasattr(sys.stdout, 'reconfigure'):
 
 def _optimize_windows_process():
     """Configura el proceso para evitar throttling y bloqueos de Windows."""
+    if sys.platform != "win32":
+        return
+
     try:
         import ctypes
         import ctypes.wintypes
@@ -98,7 +105,7 @@ from websockets.server import WebSocketServerProtocol
 from file_watcher import CopilotChatWatcher, ChatEvent
 from jsonl_parser import JSONLParser, find_most_recent_session_file
 from tts_engine import ServerTTS
-from telegram_input import get_telegram_input_handler
+from telegram_input import STTEngine, get_telegram_input_handler
 from database import get_db, Database
 
 
@@ -145,29 +152,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-def infer_ide_from_path(file_path: str) -> str:
-    """Infere el origen del chat según la ruta del archivo fuente."""
-    normalized = (file_path or "").lower()
-    if ".codex\\sessions" in normalized:
-        return "codex"
-    if "\\.cursor\\projects" in normalized:
-        return "cursor"
-    if "\\kiro\\user\\history" in normalized:
-        return "kiro"
-    if "\\code - insiders\\" in normalized:
-        return "vscode-insiders"
-    if "\\code\\user\\" in normalized:
-        return "vscode"
-    return ""
-
-
 class CopilotWebSocketServer:
     """Servidor WebSocket para transmitir eventos de chat en tiempo real."""
     
-    def __init__(self, host: str = "localhost", port: int = 8765, llm_model: str = None):
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 8765,
+        llm_model: str = None,
+        ide_filter: str = "all",
+    ):
         self.host = host
         self.port = port
+        self.ide_filter = ide_filter
         self.clients: Set[WebSocketServerProtocol] = set()
         self.watcher: Optional[CopilotChatWatcher] = None
         self.event_queue: asyncio.Queue = None  # Se inicializa en start()
@@ -178,8 +175,19 @@ class CopilotWebSocketServer:
         
         # Base de datos para persistencia
         self.db: Database = get_db()
+        self._apply_runtime_settings()
         self.current_session_id: Optional[int] = None
         self._last_saved_request_index: int = -1
+        self._session_import_mtimes: dict[str, float] = {}
+
+    def _apply_runtime_settings(self):
+        """Sincroniza secretos/settings persistidos con componentes runtime."""
+        try:
+            gemini_key = self.db.get_setting("GEMINI_API_KEY", "") or ""
+            gemini_model = self.db.get_setting("GEMINI_MODEL", "") or None
+            self.tts.configure_llm(api_key=gemini_key, model=gemini_model)
+        except Exception as e:
+            logger.warning(f"[CONFIG] No se pudieron aplicar settings runtime: {e}")
     
     def _on_telegram_input(self, text: str):
         """Callback cuando se recibe un mensaje de Telegram."""
@@ -193,13 +201,14 @@ class CopilotWebSocketServer:
                 }))
             )
     
-    def _on_audio_ready(self, audio_url: str):
+    def _on_audio_ready(self, audio_url: str, audio_key: str = ""):
         """Callback para cuando hay audio TTS listo (modo Docker)."""
         if self.loop and self.clients:
             self.loop.call_soon_threadsafe(
                 lambda: asyncio.create_task(self.broadcast({
                     "event": "tts_audio",
-                    "url": audio_url
+                    "url": audio_url,
+                    "audio_key": audio_key,
                 }))
             )
     
@@ -220,7 +229,7 @@ class CopilotWebSocketServer:
         """Envía el estado actual de la sesión al cliente."""
         try:
             ide_filter = self.watcher.ide_filter if self.watcher else "all"
-            recent_file = find_most_recent_session_file(ide_filter)
+            recent_file = self.watcher.get_selected_session_file() if self.watcher else find_most_recent_session_file(ide_filter)
             if not recent_file:
                 await websocket.send(json.dumps({
                     "event": "no_session",
@@ -230,6 +239,9 @@ class CopilotWebSocketServer:
             
             session = self.parser.parse_file(recent_file)
             messages = self.parser.get_all_messages(session)
+            agent_activity = self.parser.get_agent_activity(session)
+            session_meta = self.parser.get_session_metadata(session)
+            cwd = session_meta.get("cwd", "")
             
             # Enviar info de sesión
             await websocket.send(json.dumps({
@@ -239,6 +251,15 @@ class CopilotWebSocketServer:
                 "file": str(recent_file),
                 "message_count": len(messages),
                 "ide": infer_ide_from_path(str(recent_file)) or ide_filter,
+                "manual_follow": bool(self.watcher and self.watcher.fixed_session_file),
+                "agent_activity": agent_activity,
+                "cwd": cwd,
+                "cwd_name": session_meta.get("cwd_name", "") or (Path(cwd).name if cwd else ""),
+                "git_root": session_meta.get("git_root", ""),
+                "branch": session_meta.get("branch", ""),
+                "repository": session_meta.get("repository", ""),
+                "model": session_meta.get("model", ""),
+                "models_used": session_meta.get("models_used", []),
             }))
             
             # Enviar historial de mensajes
@@ -277,6 +298,250 @@ class CopilotWebSocketServer:
                 disconnected.add(client)
         for client in disconnected:
             self.clients.discard(client)
+
+    def _sync_codex_sessions_to_db(self):
+        """Importa o refresca todas las sesiones de Codex CLI en la base local."""
+        codex_sessions = get_codex_sessions_dir()
+        if not codex_sessions.exists():
+            return
+
+        files = sorted(
+            codex_sessions.glob("*/*/*/rollout-*.jsonl"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+
+        for session_file in files:
+            source_file = str(session_file)
+            try:
+                mtime = session_file.stat().st_mtime
+            except FileNotFoundError:
+                continue
+
+            if self._session_import_mtimes.get(source_file) == mtime:
+                continue
+
+            try:
+                session = self.parser.parse_file(session_file)
+                messages = self.parser.get_all_messages(session)
+                session_name = session.custom_title or session_file.stem
+                session_fields = self._build_persisted_session_fields(session)
+                existing = self.db.get_session_by_source(source_file)
+
+                if existing is None:
+                    session_id = self.db.create_session(name=session_name, ide="codex", source_file=source_file)
+                else:
+                    session_id = existing.id
+
+                serialized_messages = [
+                    {
+                        "role": msg.role,
+                        "text": msg.text,
+                        "request_index": msg.request_index,
+                        "timestamp": msg.timestamp,
+                        "ide": "codex",
+                        "has_thinking": False,
+                        "thinking_text": "",
+                    }
+                    for msg in messages
+                    if msg.text
+                ]
+
+                self.db.replace_session_messages(
+                    session_id,
+                    serialized_messages,
+                    name=session_name,
+                    ide="codex",
+                    source_file=source_file,
+                    session_fields=session_fields,
+                )
+                self._session_import_mtimes[source_file] = mtime
+            except Exception as e:
+                logger.warning(f"[IMPORT] No se pudo indexar sesión Codex {session_file}: {e}")
+
+    def _sync_copilot_sessions_to_db(self):
+        """Importa o refresca todas las sesiones de Copilot CLI en la base local."""
+        copilot_sessions = get_copilot_session_state_dir()
+        if not copilot_sessions.exists():
+            return
+
+        files = sorted(
+            copilot_sessions.glob("*/events.jsonl"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+
+        for session_file in files:
+            source_file = str(session_file)
+            try:
+                mtime = session_file.stat().st_mtime
+            except FileNotFoundError:
+                continue
+
+            if self._session_import_mtimes.get(source_file) == mtime:
+                continue
+
+            try:
+                session = self.parser.parse_file(session_file)
+                messages = self.parser.get_all_messages(session)
+                session_name = session.custom_title or session_file.parent.name
+                session_fields = self._build_persisted_session_fields(session)
+                existing = self.db.get_session_by_source(source_file)
+
+                if existing is None:
+                    session_id = self.db.create_session(name=session_name, ide="copilot", source_file=source_file)
+                else:
+                    session_id = existing.id
+
+                serialized_messages = [
+                    {
+                        "role": msg.role,
+                        "text": msg.text,
+                        "request_index": msg.request_index,
+                        "timestamp": msg.timestamp,
+                        "ide": "copilot",
+                        "has_thinking": False,
+                        "thinking_text": "",
+                    }
+                    for msg in messages
+                    if msg.text
+                ]
+
+                self.db.replace_session_messages(
+                    session_id,
+                    serialized_messages,
+                    name=session_name,
+                    ide="copilot",
+                    source_file=source_file,
+                    session_fields=session_fields,
+                )
+                self._session_import_mtimes[source_file] = mtime
+            except Exception as e:
+                logger.warning(f"[IMPORT] No se pudo indexar sesión Copilot {session_file}: {e}")
+
+    def _build_persisted_session_fields(self, session) -> dict[str, Any]:
+        """Convierte metadatos del parser al formato persistido en SQLite."""
+        session_meta = self.parser.get_session_metadata(session)
+        models_used = session_meta.get("models_used", [])
+        if not isinstance(models_used, list):
+            models_used = []
+        return {
+            "cwd": session_meta.get("cwd", "") or "",
+            "git_root": session_meta.get("git_root", "") or "",
+            "branch": session_meta.get("branch", "") or "",
+            "repository": session_meta.get("repository", "") or "",
+            "model": session_meta.get("model", "") or "",
+            "models_used": json.dumps(models_used, ensure_ascii=False) if models_used else "",
+        }
+
+    def _decode_models_used(self, raw_value: Any) -> list[str]:
+        """Decodifica la lista de modelos almacenada en la sesión."""
+        if isinstance(raw_value, list):
+            return [str(item) for item in raw_value if item]
+        if not raw_value:
+            return []
+        if isinstance(raw_value, str):
+            try:
+                data = json.loads(raw_value)
+            except json.JSONDecodeError:
+                return [raw_value] if raw_value.strip() else []
+            if isinstance(data, list):
+                return [str(item) for item in data if item]
+        return []
+
+    def _build_session_summary(self, session_record):
+        """Construye metadatos ricos para la tarjeta de sesión en la UI."""
+        stored_models = self._decode_models_used(getattr(session_record, "models_used", ""))
+        stored_cwd = getattr(session_record, "cwd", "")
+        stored_git_root = getattr(session_record, "git_root", "")
+        stored_branch = getattr(session_record, "branch", "")
+        stored_repository = getattr(session_record, "repository", "")
+        stored_model = getattr(session_record, "model", "") or (stored_models[-1] if stored_models else "")
+        stored_cwd_name = Path(stored_cwd or stored_git_root).name if (stored_cwd or stored_git_root) else ""
+        summary = {
+            "id": session_record.id,
+            "name": session_record.name,
+            "ide": session_record.ide,
+            "source_file": session_record.source_file,
+            "created_at": session_record.created_at,
+            "updated_at": session_record.updated_at,
+            "message_count": session_record.message_count,
+            "cwd": stored_cwd,
+            "cwd_name": stored_cwd_name,
+            "git_root": stored_git_root,
+            "branch": stored_branch,
+            "repository": stored_repository,
+            "model": stored_model,
+            "models_used": stored_models,
+            "model_count": len(stored_models) or (1 if stored_model else 0),
+            "preview_text": "",
+            "preview_role": "",
+            "preview_timestamp": 0,
+            "activity_status": "idle",
+            "activity_label": "Sin actividad",
+            "activity_detail": "",
+            "activity_timestamp": 0,
+            "current_tool": "",
+            "open_tool_count": 0,
+            "pending_approval_count": 0,
+            "archived": bool(getattr(session_record, "archived", False)),
+            "archived_at": getattr(session_record, "archived_at", ""),
+        }
+
+        source_file = session_record.source_file
+        if not source_file:
+            return summary
+
+        try:
+            session_path = Path(source_file)
+            if not session_path.exists():
+                return summary
+
+            parsed = self.parser.parse_file(session_path)
+            messages = self.parser.get_all_messages(parsed)
+            activity = self.parser.get_agent_activity(parsed) or {}
+            session_meta = self.parser.get_session_metadata(parsed)
+            cwd = session_meta.get("cwd", "")
+            git_root = session_meta.get("git_root", "")
+            models_used = session_meta.get("models_used", [])
+            model_name = session_meta.get("model", "") or (models_used[-1] if models_used else "")
+
+            if cwd:
+                summary["cwd"] = cwd
+                summary["cwd_name"] = Path(cwd).name
+            elif git_root:
+                summary["cwd_name"] = Path(git_root).name
+
+            if git_root:
+                summary["git_root"] = git_root
+            if session_meta.get("branch"):
+                summary["branch"] = session_meta.get("branch", "")
+            if session_meta.get("repository"):
+                summary["repository"] = session_meta.get("repository", "")
+            if model_name:
+                summary["model"] = model_name
+            if models_used:
+                summary["models_used"] = models_used
+                summary["model_count"] = len(models_used)
+
+            if messages:
+                last_message = messages[-1]
+                summary["preview_text"] = (last_message.text or "").strip()[:220]
+                summary["preview_role"] = last_message.role
+                summary["preview_timestamp"] = last_message.timestamp
+
+            if activity:
+                summary["activity_status"] = activity.get("status", "idle")
+                summary["activity_label"] = activity.get("label", "Sin actividad")
+                summary["activity_detail"] = activity.get("detail", "")
+                summary["activity_timestamp"] = activity.get("timestamp", 0)
+                summary["current_tool"] = activity.get("current_tool", "")
+                summary["open_tool_count"] = activity.get("open_tool_count", 0)
+                summary["pending_approval_count"] = activity.get("pending_approval_count", 0)
+        except Exception as e:
+            logger.debug(f"[UI] No se pudo construir summary para {source_file}: {e}")
+
+        return summary
     
     def on_chat_event(self, event: ChatEvent):
         """Callback para eventos del watcher (ejecuta en thread del watcher)."""
@@ -391,8 +656,8 @@ class CopilotWebSocketServer:
                     logger.debug(f"[DB] Guardada respuesta asistente: {text[:50]}...")
             
             # Nuevo archivo = nueva sesión
-            elif event.event_type == "file_changed":
-                new_file = data.get("file_path", "")
+            elif event.event_type in {"file_changed", "session_changed"}:
+                new_file = data.get("file_path", "") or data.get("file", "")
                 if new_file:
                     ide = infer_ide_from_path(new_file) or (self.watcher.ide_filter if self.watcher else "all")
                     self.current_session_id = self.db.get_or_create_session_by_source(
@@ -590,23 +855,106 @@ class CopilotWebSocketServer:
         # ══════════════════════════════════════════════════════════════════════════
         
         elif action == "db_get_sessions":
+            self._sync_codex_sessions_to_db()
+            self._sync_copilot_sessions_to_db()
             limit = data.get("limit", 50)
             offset = data.get("offset", 0)
             ide = data.get("ide", None)
-            sessions = self.db.get_sessions(limit=limit, offset=offset, ide=ide)
+            if ide == "all":
+                ide = None
+            archived = bool(data.get("archived", False))
+            sessions = self.db.get_sessions(limit=limit, offset=offset, ide=ide, archived=archived)
             await websocket.send(json.dumps({
                 "event": "db_sessions",
-                "sessions": [
-                    {
-                        "id": s.id,
-                        "name": s.name,
-                        "ide": s.ide,
-                        "created_at": s.created_at,
-                        "updated_at": s.updated_at,
-                        "message_count": s.message_count
-                    } for s in sessions
-                ]
+                "archived": archived,
+                "followed_source_file": str(self.watcher.fixed_session_file) if self.watcher and self.watcher.fixed_session_file else "",
+                "sessions": [self._build_session_summary(s) for s in sessions]
             }))
+
+        elif action == "follow_session":
+            session_id = data.get("session_id")
+            session_record = self.db.get_session(session_id) if session_id else None
+            if not session_record or not session_record.source_file:
+                await websocket.send(json.dumps({
+                    "event": "error",
+                    "message": "session_id inválido o sin archivo fuente"
+                }))
+                return
+
+            if self.watcher:
+                self.watcher.set_session_file(Path(session_record.source_file))
+                self.current_session_id = session_record.id
+                self._last_saved_request_index = session_record.message_count
+            await self.broadcast({
+                "event": "session_follow_set",
+                "session_id": session_record.id,
+                "name": session_record.name,
+                "source_file": session_record.source_file,
+                "manual": True,
+            })
+            await self._send_current_state(websocket)
+
+        elif action == "follow_latest":
+            if self.watcher:
+                self.watcher.clear_session_file()
+            await self.broadcast({
+                "event": "session_follow_set",
+                "session_id": None,
+                "name": "",
+                "source_file": "",
+                "manual": False,
+            })
+            await self._send_current_state(websocket)
+
+        elif action == "stt_transcribe":
+            audio_b64 = data.get("audio_b64", "")
+            provider = data.get("provider") or self.db.get_setting("STT_PROVIDER", "groq")
+            mime_type = data.get("mime_type", "")
+            file_ext = ".ogg"
+            if "webm" in mime_type:
+                file_ext = ".webm"
+            elif "wav" in mime_type:
+                file_ext = ".wav"
+            elif "mp3" in mime_type or "mpeg" in mime_type:
+                file_ext = ".mp3"
+
+            if not audio_b64:
+                await websocket.send(json.dumps({
+                    "event": "stt_transcription",
+                    "ok": False,
+                    "message": "audio_b64 requerido"
+                }))
+                return
+
+            try:
+                audio_bytes = base64.b64decode(audio_b64)
+                text = STTEngine.transcribe(
+                    audio_bytes,
+                    provider=provider,
+                    file_ext=file_ext,
+                    mime_type=mime_type,
+                )
+                if not text:
+                    await websocket.send(json.dumps({
+                        "event": "stt_transcription",
+                        "ok": False,
+                        "message": f"No se pudo transcribir con proveedor '{provider}'"
+                    }))
+                    return
+
+                await websocket.send(json.dumps({
+                    "event": "stt_transcription",
+                    "ok": True,
+                    "text": text,
+                    "provider": provider
+                }))
+            except Exception as e:
+                logger.error(f"[STT] Error transcribiendo desde UI: {e}")
+                await websocket.send(json.dumps({
+                    "event": "stt_transcription",
+                    "ok": False,
+                    "message": str(e)
+                }))
         
         elif action == "db_get_messages":
             session_id = data.get("session_id")
@@ -640,11 +988,13 @@ class CopilotWebSocketServer:
         elif action == "db_search":
             query = data.get("query", "")
             limit = data.get("limit", 50)
+            archived = bool(data.get("archived", False))
             if query:
-                messages = self.db.search_messages(query, limit=limit)
+                messages = self.db.search_messages(query, limit=limit, archived=archived)
                 await websocket.send(json.dumps({
                     "event": "db_search_results",
                     "query": query,
+                    "archived": archived,
                     "messages": [
                         {
                             "id": m.id,
@@ -659,6 +1009,7 @@ class CopilotWebSocketServer:
                 await websocket.send(json.dumps({
                     "event": "db_search_results",
                     "query": "",
+                    "archived": archived,
                     "messages": []
                 }))
         
@@ -697,6 +1048,24 @@ class CopilotWebSocketServer:
                     "event": "error",
                     "message": "session_id requerido"
                 }))
+
+        elif action == "db_set_session_archived":
+            session_id = data.get("session_id")
+            archived = bool(data.get("archived", False))
+            if session_id:
+                self.db.set_session_archived(session_id, archived)
+                session_record = self.db.get_session(session_id)
+                await websocket.send(json.dumps({
+                    "event": "db_session_archived_state",
+                    "session_id": session_id,
+                    "archived": archived,
+                    "name": session_record.name if session_record else "",
+                }))
+            else:
+                await websocket.send(json.dumps({
+                    "event": "error",
+                    "message": "session_id requerido"
+                }))
         
         elif action == "db_stats":
             stats = self.db.get_stats()
@@ -718,6 +1087,8 @@ class CopilotWebSocketServer:
             encrypted = data.get("encrypted", False)
             if key is not None:
                 self.db.set_setting(key, value, encrypted)
+                if key in {"GEMINI_API_KEY", "GEMINI_MODEL"}:
+                    self._apply_runtime_settings()
                 await websocket.send(json.dumps({
                     "event": "db_setting_saved",
                     "key": key
@@ -739,7 +1110,7 @@ class CopilotWebSocketServer:
         self.tts.start()
         
         # Iniciar watcher (sin thread de polling - usaremos asyncio)
-        self.watcher = CopilotChatWatcher(self.on_chat_event)
+        self.watcher = CopilotChatWatcher(self.on_chat_event, ide_filter=self.ide_filter)
         self.watcher.start(use_watchdog=False)
         # Detener el thread de polling si se inició
         self.watcher.polling_active = False
@@ -814,10 +1185,18 @@ class CopilotWebSocketServer:
             self.tts.stop()
 
 
-def start_http_server(port: int, directory: Path, audio_dir: Path = None):
+def start_http_server(host: str, port: int, directory: Path, audio_dir: Path = None):
     """Inicia un servidor HTTP para servir la UI y archivos de audio."""
     
     class QuietHandler(http.server.SimpleHTTPRequestHandler):
+        def _origin_allowed(self) -> bool:
+            origin = self.headers.get("Origin", "")
+            if not origin:
+                return True
+            origin_host = urlparse(origin).hostname or ""
+            request_host = (self.headers.get("Host", "") or "").split(":", 1)[0]
+            return bool(origin_host and request_host and origin_host == request_host)
+
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=str(directory), **kwargs)
         
@@ -844,16 +1223,91 @@ def start_http_server(port: int, directory: Path, audio_dir: Path = None):
                     return
             # Servir archivos normales de la UI
             super().do_GET()
+
+        def do_OPTIONS(self):
+            if not self._origin_allowed():
+                self.send_error(403, "Origin not allowed")
+                return
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.end_headers()
+
+        def do_POST(self):
+            parsed = urlparse(self.path)
+            if parsed.path != "/api/stt":
+                self.send_error(404, "Not found")
+                return
+            if not self._origin_allowed():
+                self.send_error(403, "Origin not allowed")
+                return
+
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                content_length = 0
+
+            if content_length <= 0:
+                self._send_json(400, {"ok": False, "message": "audio requerido"})
+                return
+
+            try:
+                audio_bytes = self.rfile.read(content_length)
+                provider = parse_qs(parsed.query).get("provider", [""])[0] or get_db().get_setting("STT_PROVIDER", "groq")
+                mime_type = self.headers.get("Content-Type", "")
+                file_ext = ".ogg"
+                if "webm" in mime_type:
+                    file_ext = ".webm"
+                elif "wav" in mime_type:
+                    file_ext = ".wav"
+                elif "mp3" in mime_type or "mpeg" in mime_type:
+                    file_ext = ".mp3"
+
+                text = STTEngine.transcribe(
+                    audio_bytes,
+                    provider=provider,
+                    file_ext=file_ext,
+                    mime_type=mime_type,
+                )
+                if not text:
+                    self._send_json(400, {
+                        "ok": False,
+                        "message": f"No se pudo transcribir con proveedor '{provider}'",
+                        "provider": provider,
+                    })
+                    return
+
+                self._send_json(200, {
+                    "ok": True,
+                    "text": text,
+                    "provider": provider,
+                })
+            except Exception as e:
+                logger.error(f"[STT] Error transcribiendo por HTTP: {e}")
+                self._send_json(500, {"ok": False, "message": str(e)})
+
+        def _send_json(self, status: int, payload: dict):
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         
         def end_headers(self):
             self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
             self.send_header('Pragma', 'no-cache')
             self.send_header('Expires', '0')
-            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('X-Frame-Options', 'SAMEORIGIN')
+            self.send_header('Referrer-Policy', 'same-origin')
             super().end_headers()
     
-    with socketserver.TCPServer(("", port), QuietHandler) as httpd:
-        logger.info(f"Servidor HTTP para UI en http://localhost:{port}")
+    class ReusableTCPServer(socketserver.TCPServer):
+        allow_reuse_address = True
+
+    with ReusableTCPServer((host, port), QuietHandler) as httpd:
+        logger.info(f"Servidor HTTP para UI en http://{host}:{port}")
         httpd.serve_forever()
 
 
@@ -861,8 +1315,10 @@ async def main():
     parser = argparse.ArgumentParser(description="Copilot Chat WebSocket Server")
     parser.add_argument("--host", default="localhost", help="Host WebSocket (default: localhost)")
     parser.add_argument("--port", type=int, default=8765, help="Puerto WebSocket (default: 8765)")
+    parser.add_argument("--ui-host", default="127.0.0.1", help="Host HTTP para la UI (default: 127.0.0.1)")
     parser.add_argument("--ui-port", type=int, default=8080, help="Puerto HTTP para UI (default: 8080)")
     parser.add_argument("--llm-model", default=None, help="Modelo Gemini para procesar TTS (usa GEMINI_MODEL del .env)")
+    parser.add_argument("--ide", default="all", help="IDE a monitorear: all, vscode, vscode-insiders, cursor, kiro, codex, copilot")
     args = parser.parse_args()
     
     # Directorio de la UI (relativo al script)
@@ -879,16 +1335,21 @@ async def main():
     # Iniciar servidor HTTP en thread separado
     http_thread = threading.Thread(
         target=start_http_server,
-        args=(args.ui_port, ui_dir, audio_dir),
+        args=(args.ui_host, args.ui_port, ui_dir, audio_dir),
         daemon=True
     )
     http_thread.start()
     
     # Iniciar servidor WebSocket
-    server = CopilotWebSocketServer(host=args.host, port=args.port, llm_model=args.llm_model)
+    server = CopilotWebSocketServer(
+        host=args.host,
+        port=args.port,
+        llm_model=args.llm_model,
+        ide_filter=args.ide,
+    )
     
     logger.info(f"\n{'='*50}")
-    logger.info(f"  ABRE EN EL NAVEGADOR: http://localhost:{args.ui_port}")
+    logger.info(f"  ABRE EN EL NAVEGADOR: http://{args.ui_host}:{args.ui_port}")
     logger.info(f"{'='*50}\n")
     
     try:

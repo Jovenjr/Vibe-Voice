@@ -37,6 +37,8 @@ import tempfile
 from pathlib import Path
 from typing import Optional, Literal
 
+from database import get_db
+
 logger = logging.getLogger(__name__)
 
 # ============================================================
@@ -115,6 +117,24 @@ class STTEngine:
     """Motor de Speech-to-Text con múltiples proveedores."""
     
     _whisper_model = None  # Singleton para no cargar el modelo cada vez
+
+    @classmethod
+    def _get_runtime_setting(cls, key: str, default: str = "") -> str:
+        try:
+            value = get_db().get_setting(key, None)
+            if value not in (None, ""):
+                return str(value)
+        except Exception as e:
+            logger.debug(f"[STT] No se pudo leer setting {key} desde DB: {e}")
+        return os.getenv(key, default)
+
+    @classmethod
+    def _get_runtime_provider(cls) -> str:
+        return cls._get_runtime_setting("STT_PROVIDER", STT_PROVIDER)
+
+    @classmethod
+    def _get_runtime_whisper_model(cls) -> str:
+        return cls._get_runtime_setting("WHISPER_MODEL", WHISPER_MODEL)
     
     @classmethod
     def get_available_providers(cls) -> list[str]:
@@ -122,16 +142,22 @@ class STTEngine:
         providers = []
         if WHISPER_AVAILABLE:
             providers.append("whisper_local")
-        if GROQ_AVAILABLE and GROQ_API_KEY:
+        if GROQ_AVAILABLE and cls._get_runtime_setting("GROQ_API_KEY", GROQ_API_KEY):
             providers.append("groq")
-        if GEMINI_AVAILABLE and GEMINI_API_KEY:
+        if GEMINI_AVAILABLE and cls._get_runtime_setting("GEMINI_API_KEY", GEMINI_API_KEY):
             providers.append("gemini")
         if GOOGLE_CLOUD_STT_AVAILABLE:
             providers.append("google_cloud")
         return providers
     
     @classmethod
-    def transcribe(cls, audio_bytes: bytes, provider: STTProvider = None) -> Optional[str]:
+    def transcribe(
+        cls,
+        audio_bytes: bytes,
+        provider: STTProvider = None,
+        file_ext: str = ".ogg",
+        mime_type: str = "",
+    ) -> Optional[str]:
         """
         Transcribe audio a texto usando el proveedor especificado.
         
@@ -142,24 +168,24 @@ class STTEngine:
         Returns:
             Texto transcrito o None si hay error
         """
-        provider = provider or STT_PROVIDER
+        provider = provider or cls._get_runtime_provider()
         
         logger.info(f"[STT] Transcribiendo con proveedor: {provider}")
         
         if provider == "whisper_local":
-            return cls._transcribe_whisper(audio_bytes)
+            return cls._transcribe_whisper(audio_bytes, file_ext=file_ext)
         elif provider == "groq":
-            return cls._transcribe_groq(audio_bytes)
+            return cls._transcribe_groq(audio_bytes, file_ext=file_ext)
         elif provider == "gemini":
-            return cls._transcribe_gemini(audio_bytes)
+            return cls._transcribe_gemini(audio_bytes, file_ext=file_ext)
         elif provider == "google_cloud":
-            return cls._transcribe_google_cloud(audio_bytes)
+            return cls._transcribe_google_cloud(audio_bytes, file_ext=file_ext, mime_type=mime_type)
         else:
             logger.error(f"[STT] Proveedor desconocido: {provider}")
             return None
     
     @classmethod
-    def _transcribe_whisper(cls, audio_bytes: bytes) -> Optional[str]:
+    def _transcribe_whisper(cls, audio_bytes: bytes, file_ext: str = ".ogg") -> Optional[str]:
         """Transcribe usando Whisper local."""
         if not WHISPER_AVAILABLE:
             logger.error("[STT] Whisper no está instalado. pip install openai-whisper")
@@ -168,12 +194,13 @@ class STTEngine:
         try:
             # Cargar modelo si no está cargado (singleton)
             if cls._whisper_model is None:
-                logger.info(f"[STT] Cargando modelo Whisper: {WHISPER_MODEL}")
-                cls._whisper_model = whisper.load_model(WHISPER_MODEL)
+                model_name = cls._get_runtime_whisper_model()
+                logger.info(f"[STT] Cargando modelo Whisper: {model_name}")
+                cls._whisper_model = whisper.load_model(model_name)
                 logger.info("[STT] Modelo Whisper cargado")
             
             # Guardar audio temporalmente (Whisper necesita archivo)
-            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
+            with tempfile.NamedTemporaryFile(suffix=file_ext, delete=False) as f:
                 f.write(audio_bytes)
                 temp_path = f.name
             
@@ -199,24 +226,25 @@ class STTEngine:
             return None
     
     @classmethod
-    def _transcribe_groq(cls, audio_bytes: bytes) -> Optional[str]:
+    def _transcribe_groq(cls, audio_bytes: bytes, file_ext: str = ".ogg") -> Optional[str]:
         """Transcribe usando Groq Cloud (Whisper Large v3 Turbo)."""
         if not GROQ_AVAILABLE:
             logger.error("[STT] groq no está instalado. pip install groq")
             return None
         
-        if not GROQ_API_KEY:
-            logger.error("[STT] GROQ_API_KEY no configurada en .env")
+        groq_api_key = cls._get_runtime_setting("GROQ_API_KEY", GROQ_API_KEY)
+        if not groq_api_key:
+            logger.error("[STT] GROQ_API_KEY no configurada")
             return None
         
         try:
             # Guardar temporalmente (Groq necesita archivo)
-            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
+            with tempfile.NamedTemporaryFile(suffix=file_ext, delete=False) as f:
                 f.write(audio_bytes)
                 temp_path = f.name
             
             try:
-                client = Groq(api_key=GROQ_API_KEY)
+                client = Groq(api_key=groq_api_key)
                 
                 with open(temp_path, "rb") as audio_file:
                     transcription = client.audio.transcriptions.create(
@@ -242,25 +270,26 @@ class STTEngine:
             return None
     
     @classmethod
-    def _transcribe_gemini(cls, audio_bytes: bytes) -> Optional[str]:
+    def _transcribe_gemini(cls, audio_bytes: bytes, file_ext: str = ".ogg") -> Optional[str]:
         """Transcribe usando Google Gemini API."""
         if not GEMINI_AVAILABLE:
             logger.error("[STT] google-genai no está instalado. pip install google-genai")
             return None
         
-        if not GEMINI_API_KEY:
-            logger.error("[STT] GEMINI_API_KEY no configurada en .env")
+        gemini_api_key = cls._get_runtime_setting("GEMINI_API_KEY", GEMINI_API_KEY)
+        if not gemini_api_key:
+            logger.error("[STT] GEMINI_API_KEY no configurada")
             return None
         
         try:
             # Guardar temporalmente
-            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
+            with tempfile.NamedTemporaryFile(suffix=file_ext, delete=False) as f:
                 f.write(audio_bytes)
                 temp_path = f.name
             
             try:
                 # Inicializar cliente
-                client = genai.Client(api_key=GEMINI_API_KEY)
+                client = genai.Client(api_key=gemini_api_key)
                 
                 # Subir archivo
                 audio_file = client.files.upload(file=temp_path)
@@ -291,7 +320,12 @@ class STTEngine:
             return None
     
     @classmethod
-    def _transcribe_google_cloud(cls, audio_bytes: bytes) -> Optional[str]:
+    def _transcribe_google_cloud(
+        cls,
+        audio_bytes: bytes,
+        file_ext: str = ".ogg",
+        mime_type: str = "",
+    ) -> Optional[str]:
         """Transcribe usando Google Cloud Speech-to-Text."""
         if not GOOGLE_CLOUD_STT_AVAILABLE:
             logger.error("[STT] google-cloud-speech no está instalado. pip install google-cloud-speech")
@@ -301,8 +335,11 @@ class STTEngine:
             client = speech.SpeechClient()
             
             audio = speech.RecognitionAudio(content=audio_bytes)
+            encoding = speech.RecognitionConfig.AudioEncoding.OGG_OPUS
+            if file_ext == ".webm" or "webm" in mime_type:
+                encoding = speech.RecognitionConfig.AudioEncoding.WEBM_OPUS
             config = speech.RecognitionConfig(
-                encoding=speech.RecognitionConfig.AudioEncoding.OGG_OPUS,
+                encoding=encoding,
                 sample_rate_hertz=48000,
                 language_code="es-ES",
                 enable_automatic_punctuation=True,

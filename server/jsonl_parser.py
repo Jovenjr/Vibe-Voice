@@ -11,11 +11,19 @@ El formato usa tres tipos de operaciones:
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from platform_paths import (
+    get_copilot_session_state_dir,
+    get_codex_sessions_dir,
+    get_cursor_projects_dir,
+    get_empty_window_chat_roots,
+    get_workspace_storage_roots,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,14 +97,18 @@ class JSONLParser:
         """
         Parsea una línea JSONL y actualiza el estado.
         Retorna (tipo_operacion, datos_relevantes).
-        Soporta formato VS Code (kind 0/1/2), Cursor (role + message)
-        y Codex CLI (type + payload).
+        Soporta formato VS Code (kind 0/1/2), Cursor (role + message),
+        Codex CLI (type + payload) y Copilot CLI (type + data).
         """
         entry = json.loads(line.strip())
-        
+
         # Detectar formato Codex CLI
         if "type" in entry and "payload" in entry:
             return self._parse_codex_line(entry, state)
+
+        # Detectar formato Copilot CLI
+        if "type" in entry and "data" in entry:
+            return self._parse_copilot_line(entry, state)
 
         # Detectar formato Cursor (tiene 'role' en lugar de 'kind')
         if "role" in entry and "message" in entry:
@@ -130,10 +142,200 @@ class JSONLParser:
         
         return ("unknown", entry)
 
+    def _parse_copilot_line(self, entry: Dict, state: Dict) -> Tuple[str, Any]:
+        """Parsea una línea en formato Copilot CLI events.jsonl."""
+        event_type = entry.get("type", "")
+        data = entry.get("data", {})
+        timestamp = self._parse_codex_timestamp(entry.get("timestamp", ""))
+
+        if event_type == "session.start" and isinstance(data, dict):
+            session_id = data.get("sessionId", "")
+            context = data.get("context", {}) if isinstance(data.get("context"), dict) else {}
+            cwd = context.get("cwd", "")
+            git_root = context.get("gitRoot", "")
+            branch = context.get("branch", "")
+            if session_id:
+                state["sessionId"] = session_id
+            state["customTitle"] = Path(cwd or git_root).name if (cwd or git_root) else "Copilot CLI"
+            state["copilot_meta"] = {
+                "cwd": cwd,
+                "git_root": git_root,
+                "branch": branch,
+                "repository": context.get("repository", ""),
+                "producer": data.get("producer", ""),
+                "session_format_version": data.get("version", ""),
+                "copilot_version": data.get("copilotVersion", ""),
+            }
+            self._remember_copilot_model(state, data)
+            return ("copilot_meta", state["copilot_meta"])
+
+        self._remember_copilot_model(state, data)
+
+        if event_type == "user.message" and isinstance(data, dict):
+            text = (data.get("content") or "").strip()
+            if not text:
+                return ("unknown", entry)
+            messages = state.setdefault("copilot_messages", [])
+            message_data = {
+                "role": "user",
+                "text": text,
+                "timestamp": timestamp,
+                "index": len(messages),
+            }
+            messages.append(message_data)
+            self._update_copilot_activity(
+                state,
+                status="waiting",
+                label="Esperando agente",
+                detail="Mensaje enviado",
+                timestamp=timestamp,
+            )
+            return ("copilot_user", message_data)
+
+        if event_type == "assistant.turn_start":
+            snapshot = self._update_copilot_activity(
+                state,
+                status="reasoning",
+                label="Pensando",
+                detail="Copilot comenzo un turno",
+                timestamp=timestamp,
+            )
+            return ("copilot_activity", snapshot)
+
+        if event_type == "assistant.message" and isinstance(data, dict):
+            messages = state.setdefault("copilot_messages", [])
+            content = (data.get("content") or "").strip()
+            if content:
+                message_data = {
+                    "role": "assistant",
+                    "text": content,
+                    "timestamp": timestamp,
+                    "index": len(messages),
+                }
+                messages.append(message_data)
+                self._update_copilot_activity(
+                    state,
+                    status="final",
+                    label="Respuesta lista",
+                    detail=content[:180],
+                    timestamp=timestamp,
+                )
+                return ("copilot_assistant", message_data)
+
+            tool_requests = data.get("toolRequests", [])
+            if isinstance(tool_requests, list) and tool_requests:
+                detail = self._format_copilot_tool_detail(tool_requests[-1])
+                snapshot = self._update_copilot_activity(
+                    state,
+                    status="working",
+                    label="Preparando herramientas",
+                    detail=detail,
+                    timestamp=timestamp,
+                )
+                return ("copilot_activity", snapshot)
+            return ("unknown", entry)
+
+        if event_type == "tool.execution_start" and isinstance(data, dict):
+            snapshot = self._update_copilot_activity(
+                state,
+                status="tool_running",
+                label="Ejecutando herramienta",
+                detail=self._format_copilot_tool_detail(data),
+                timestamp=timestamp,
+                tool_call=data,
+            )
+            return ("copilot_activity", snapshot)
+
+        if event_type == "tool.execution_complete" and isinstance(data, dict):
+            success = bool(data.get("success", False))
+            snapshot = self._update_copilot_activity(
+                state,
+                status="working" if success else "error",
+                label="Procesando resultados" if success else "Error",
+                detail=self._format_copilot_tool_result(data),
+                timestamp=timestamp,
+                tool_output=data,
+            )
+            return ("copilot_activity", snapshot)
+
+        if event_type == "assistant.turn_end":
+            snapshot = self._update_copilot_activity(
+                state,
+                status="final",
+                label="Terminado",
+                detail="Turno completado",
+                timestamp=timestamp,
+            )
+            return ("copilot_activity", snapshot)
+
+        if event_type == "session.error" and isinstance(data, dict):
+            snapshot = self._update_copilot_activity(
+                state,
+                status="error",
+                label="Error",
+                detail=(data.get("message") or data.get("errorType") or "Error de sesion")[:180],
+                timestamp=timestamp,
+            )
+            return ("copilot_activity", snapshot)
+
+        if event_type == "session.info" and isinstance(data, dict):
+            detail = (data.get("message") or "").strip()
+            if detail:
+                snapshot = self._update_copilot_activity(
+                    state,
+                    status="waiting" if "login" in detail.lower() else "working",
+                    label="Info de sesion",
+                    detail=detail[:180],
+                    timestamp=timestamp,
+                )
+                return ("copilot_activity", snapshot)
+
+        return ("unknown", entry)
+
+    def _extract_model_name(self, value: Any, depth: int = 0) -> str:
+        """Busca nombres de modelo en payloads anidados de Copilot CLI."""
+        if depth > 4:
+            return ""
+        if isinstance(value, dict):
+            for key in ("model", "modelId", "model_id"):
+                candidate = value.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    return candidate.strip()
+            for nested_value in value.values():
+                candidate = self._extract_model_name(nested_value, depth + 1)
+                if candidate:
+                    return candidate
+            return ""
+        if isinstance(value, list):
+            for item in value:
+                candidate = self._extract_model_name(item, depth + 1)
+                if candidate:
+                    return candidate
+        return ""
+
+    def _remember_copilot_model(self, state: Dict, payload: Any) -> str:
+        """Guarda el modelo más reciente y el historial corto de modelos usados."""
+        model_name = self._extract_model_name(payload)
+        if not model_name:
+            return ""
+
+        models_used = state.setdefault("copilot_models", [])
+        if model_name in models_used:
+            models_used.remove(model_name)
+        models_used.append(model_name)
+        if len(models_used) > 6:
+            del models_used[:-6]
+
+        meta = state.setdefault("copilot_meta", {})
+        meta["model"] = model_name
+        meta["models_used"] = list(models_used)
+        return model_name
+
     def _parse_codex_line(self, entry: Dict, state: Dict) -> Tuple[str, Any]:
         """Parsea una línea en formato Codex CLI rollout JSONL."""
         line_type = entry.get("type", "")
         payload = entry.get("payload", {})
+        timestamp = self._parse_codex_timestamp(entry.get("timestamp", ""))
 
         if line_type == "session_meta":
             session_id = payload.get("id", "")
@@ -145,7 +347,41 @@ class JSONLParser:
             return ("codex_meta", payload)
 
         if line_type == "event_msg" and isinstance(payload, dict):
-            if payload.get("type") == "user_message":
+            event_type = payload.get("type")
+            if event_type == "task_started":
+                snapshot = self._update_codex_activity(
+                    state,
+                    status="working",
+                    label="Iniciando tarea",
+                    detail="Codex comenzo a trabajar",
+                    timestamp=timestamp,
+                    task_started=True,
+                )
+                return ("codex_activity", snapshot)
+
+            if event_type == "agent_message":
+                phase = payload.get("phase", "")
+                detail = (payload.get("message") or "").strip()
+                snapshot = self._update_codex_activity(
+                    state,
+                    status="commentary" if phase == "commentary" else "working",
+                    label="Comentando" if phase == "commentary" else "Trabajando",
+                    detail=detail[:180],
+                    timestamp=timestamp,
+                )
+                return ("codex_activity", snapshot)
+
+            if event_type == "token_count":
+                snapshot = self._update_codex_activity(
+                    state,
+                    status="working",
+                    label="Trabajando",
+                    detail="Actualizando conteo de tokens",
+                    timestamp=timestamp,
+                )
+                return ("codex_activity", snapshot)
+
+            if event_type == "user_message":
                 text = (payload.get("message") or "").strip()
                 if not text:
                     return ("unknown", entry)
@@ -155,12 +391,79 @@ class JSONLParser:
                     "role": "user",
                     "text": text,
                     "phase": "user_message",
-                    "timestamp": self._parse_codex_timestamp(entry.get("timestamp", "")),
+                    "timestamp": timestamp,
                     "index": len(state["codex_messages"]),
                 }
                 state["codex_messages"].append(message_data)
+                self._update_codex_activity(
+                    state,
+                    status="working",
+                    label="Esperando agente",
+                    detail="Mensaje enviado",
+                    timestamp=timestamp,
+                )
                 return ("codex_user", message_data)
+            if event_type == "task_complete":
+                snapshot = self._update_codex_activity(
+                    state,
+                    status="final",
+                    label="Terminado",
+                    detail="Tarea completada",
+                    timestamp=timestamp,
+                    task_completed=True,
+                )
+                return ("codex_activity", snapshot)
             return ("unknown", entry)
+
+        if line_type == "response_item" and isinstance(payload, dict):
+            payload_type = payload.get("type")
+
+            if payload_type == "reasoning":
+                snapshot = self._update_codex_activity(
+                    state,
+                    status="reasoning",
+                    label="Pensando",
+                    detail="Razonamiento interno activo",
+                    timestamp=timestamp,
+                )
+                return ("codex_activity", snapshot)
+
+            if payload_type == "function_call":
+                tool_name = payload.get("name", "tool")
+                tool_detail = self._format_codex_tool_detail(payload)
+                snapshot = self._update_codex_activity(
+                    state,
+                    status="tool_running",
+                    label="Ejecutando herramienta",
+                    detail=tool_detail,
+                    timestamp=timestamp,
+                    tool_call=payload,
+                )
+                return ("codex_activity", snapshot)
+
+            if payload_type == "function_call_output":
+                output_text = payload.get("output", "") if isinstance(payload.get("output", ""), str) else ""
+                exit_code = self._extract_tool_exit_code(output_text)
+                if exit_code not in (None, 0):
+                    snapshot = self._update_codex_activity(
+                        state,
+                        status="error",
+                        label="Error",
+                        detail=f"Herramienta fallo (exit {exit_code})",
+                        timestamp=timestamp,
+                        tool_output=payload,
+                    )
+                    return ("codex_activity", snapshot)
+
+                snapshot = self._update_codex_activity(
+                    state,
+                    status="working",
+                    label="Procesando resultados",
+                    detail="Herramienta terminada",
+                    timestamp=timestamp,
+                    tool_output=payload,
+                )
+                return ("codex_activity", snapshot)
 
         if line_type != "response_item" or not isinstance(payload, dict):
             return ("unknown", entry)
@@ -179,7 +482,6 @@ class JSONLParser:
         if "codex_messages" not in state:
             state["codex_messages"] = []
 
-        timestamp = self._parse_codex_timestamp(entry.get("timestamp", ""))
         message_data = {
             "role": role,
             "text": text,
@@ -188,10 +490,296 @@ class JSONLParser:
             "index": len(state["codex_messages"]),
         }
         state["codex_messages"].append(message_data)
+        phase = payload.get("phase", "")
+        if phase == "commentary":
+            self._update_codex_activity(
+                state,
+                status="commentary",
+                label="Comentando",
+                detail=text[:180],
+                timestamp=timestamp,
+            )
+        else:
+            self._update_codex_activity(
+                state,
+                status="final",
+                label="Respuesta lista",
+                detail=text[:180],
+                timestamp=timestamp,
+                mark_final_message=True,
+            )
 
         if role == "user":
             return ("codex_user", message_data)
         return ("codex_assistant", message_data)
+
+    def _ensure_codex_activity(self, state: Dict) -> Dict[str, Any]:
+        activity = state.get("codex_activity")
+        if not isinstance(activity, dict):
+            activity = {
+                "status": "idle",
+                "label": "Sin actividad",
+                "detail": "",
+                "timestamp": 0,
+                "_open_tools": {},
+                "active_task_count": 0,
+                "last_task_started_at": 0,
+                "last_task_completed_at": 0,
+                "has_final_message": False,
+            }
+            state["codex_activity"] = activity
+        activity.setdefault("_open_tools", {})
+        activity.setdefault("active_task_count", 0)
+        activity.setdefault("last_task_started_at", 0)
+        activity.setdefault("last_task_completed_at", 0)
+        activity.setdefault("has_final_message", False)
+        return activity
+
+    def _snapshot_codex_activity(self, activity: Dict[str, Any]) -> Dict[str, Any]:
+        return self._snapshot_activity(activity)
+
+    def _snapshot_activity(self, activity: Dict[str, Any]) -> Dict[str, Any]:
+        open_tools = activity.get("_open_tools", {})
+        tool_names = [tool.get("label", "") for tool in open_tools.values() if tool.get("label")]
+        current_tool = tool_names[-1] if tool_names else ""
+        pending_approval_count = sum(1 for tool in open_tools.values() if tool.get("requires_confirmation"))
+        return {
+            "status": activity.get("status", "idle"),
+            "label": activity.get("label", "Sin actividad"),
+            "detail": activity.get("detail", ""),
+            "timestamp": activity.get("timestamp", 0),
+            "open_tool_count": len(open_tools),
+            "pending_approval_count": pending_approval_count,
+            "current_tool": current_tool,
+            "open_tools": tool_names[-3:],
+            "active_task_count": activity.get("active_task_count", 0),
+        }
+
+    def _parse_tool_arguments(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        arguments = payload.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                return json.loads(arguments)
+            except Exception:
+                return {}
+        if isinstance(arguments, dict):
+            return arguments
+        return {}
+
+    def _format_codex_tool_detail(self, payload: Dict[str, Any]) -> str:
+        name = payload.get("name", "tool")
+        detail = name
+        parsed_args = self._parse_tool_arguments(payload)
+
+        if name == "exec_command":
+            cmd = parsed_args.get("cmd", "")
+            if cmd:
+                detail = f"{name}: {cmd[:80]}"
+        elif name == "apply_patch":
+            detail = "apply_patch"
+        elif parsed_args:
+            first_key = next(iter(parsed_args.keys()), "")
+            if first_key:
+                detail = f"{name}: {first_key}"
+        return detail[:180]
+
+    def _extract_tool_exit_code(self, output_text: str) -> Optional[int]:
+        """Extrae código de salida desde function_call_output si está presente."""
+        if not output_text:
+            return None
+        match = re.search(r"Process exited with code\s+(-?\d+)", output_text)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                return None
+        return None
+
+    def _tool_requires_confirmation(self, payload: Dict[str, Any]) -> bool:
+        parsed_args = self._parse_tool_arguments(payload)
+        return parsed_args.get("sandbox_permissions") == "require_escalated"
+
+    def _ensure_copilot_activity(self, state: Dict) -> Dict[str, Any]:
+        activity = state.get("copilot_activity")
+        if not isinstance(activity, dict):
+            activity = {
+                "status": "idle",
+                "label": "Sin actividad",
+                "detail": "",
+                "timestamp": 0,
+                "_open_tools": {},
+            }
+            state["copilot_activity"] = activity
+        activity.setdefault("_open_tools", {})
+        return activity
+
+    def _format_copilot_tool_detail(self, payload: Dict[str, Any]) -> str:
+        name = payload.get("toolName") or payload.get("name") or "tool"
+        args = payload.get("arguments", {})
+        detail = name
+        if isinstance(args, dict):
+            if name in ("bash", "read_bash", "write_bash", "stop_bash", "list_bash"):
+                command = args.get("command", "")
+                if command:
+                    detail = f"{name}: {command[:80]}"
+            elif name == "view":
+                path = args.get("path", "")
+                if path:
+                    detail = f"{name}: {path}"
+            elif name == "ask_user":
+                question = args.get("question", "")
+                if question:
+                    detail = f"{name}: {question[:80]}"
+            else:
+                first_key = next(iter(args.keys()), "")
+                if first_key:
+                    detail = f"{name}: {first_key}"
+        return detail[:180]
+
+    def _copilot_tool_requires_confirmation(self, payload: Dict[str, Any]) -> bool:
+        tool_name = payload.get("toolName") or payload.get("name") or ""
+        return tool_name == "ask_user"
+
+    def _format_copilot_tool_result(self, payload: Dict[str, Any]) -> str:
+        result = payload.get("result", {})
+        if isinstance(result, dict):
+            text = (result.get("content") or result.get("detailedContent") or "").strip()
+            if text:
+                return text[:180]
+        return "Herramienta terminada" if payload.get("success", False) else "Herramienta fallo"
+
+    def _update_copilot_activity(
+        self,
+        state: Dict,
+        *,
+        status: str,
+        label: str,
+        detail: str,
+        timestamp: int,
+        tool_call: Optional[Dict[str, Any]] = None,
+        tool_output: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        activity = self._ensure_copilot_activity(state)
+        open_tools = activity["_open_tools"]
+
+        if tool_call:
+            call_id = tool_call.get("toolCallId", "")
+            if call_id:
+                requires_confirmation = self._copilot_tool_requires_confirmation(tool_call)
+                open_tools[call_id] = {
+                    "name": tool_call.get("toolName", "tool"),
+                    "label": self._format_copilot_tool_detail(tool_call),
+                    "requires_confirmation": requires_confirmation,
+                }
+                if requires_confirmation:
+                    status = "waiting_input"
+                    label = "Esperando confirmacion"
+                    detail = open_tools[call_id]["label"]
+
+        if tool_output:
+            call_id = tool_output.get("toolCallId", "")
+            success = bool(tool_output.get("success", False))
+            if call_id:
+                open_tools.pop(call_id, None)
+            if not success:
+                status = "error"
+                label = "Error"
+            elif any(tool.get("requires_confirmation") for tool in open_tools.values()):
+                status = "waiting_input"
+                label = "Esperando confirmacion"
+                detail = list(open_tools.values())[-1].get("label", detail)
+            elif open_tools:
+                status = "tool_running"
+                label = "Ejecutando herramienta"
+                detail = list(open_tools.values())[-1].get("label", detail)
+
+        activity["status"] = status
+        activity["label"] = label
+        activity["detail"] = detail
+        activity["timestamp"] = timestamp
+        return self._snapshot_activity(activity)
+
+    def _update_codex_activity(
+        self,
+        state: Dict,
+        *,
+        status: str,
+        label: str,
+        detail: str,
+        timestamp: int,
+        tool_call: Optional[Dict[str, Any]] = None,
+        tool_output: Optional[Dict[str, Any]] = None,
+        task_started: bool = False,
+        task_completed: bool = False,
+        mark_final_message: bool = False,
+    ) -> Dict[str, Any]:
+        activity = self._ensure_codex_activity(state)
+        open_tools = activity["_open_tools"]
+        if task_started:
+            activity["active_task_count"] = max(0, int(activity.get("active_task_count", 0))) + 1
+            activity["last_task_started_at"] = timestamp
+            activity["has_final_message"] = False
+
+        if task_completed:
+            activity["active_task_count"] = max(0, int(activity.get("active_task_count", 0)) - 1)
+            activity["last_task_completed_at"] = timestamp
+            activity["has_final_message"] = True
+            open_tools.clear()
+
+        if mark_final_message:
+            activity["has_final_message"] = True
+            activity["active_task_count"] = 0
+            open_tools.clear()
+
+        if tool_call:
+            call_id = tool_call.get("call_id", "")
+            if call_id:
+                requires_confirmation = self._tool_requires_confirmation(tool_call)
+                open_tools[call_id] = {
+                    "name": tool_call.get("name", "tool"),
+                    "label": self._format_codex_tool_detail(tool_call),
+                    "requires_confirmation": requires_confirmation,
+                }
+                if requires_confirmation:
+                    status = "waiting_input"
+                    label = "Esperando confirmacion"
+                    detail = open_tools[call_id]["label"]
+
+        if tool_output:
+            call_id = tool_output.get("call_id", "")
+            if call_id:
+                open_tools.pop(call_id, None)
+            if any(tool.get("requires_confirmation") for tool in open_tools.values()):
+                status = "waiting_input"
+                label = "Esperando confirmacion"
+                detail = list(open_tools.values())[-1].get("label", detail)
+            elif open_tools:
+                status = "tool_running"
+                label = "Ejecutando herramienta"
+                detail = list(open_tools.values())[-1].get("label", detail)
+
+        if status not in {"error", "final"}:
+            if any(tool.get("requires_confirmation") for tool in open_tools.values()):
+                status = "waiting_input"
+                label = "Esperando confirmacion"
+                detail = list(open_tools.values())[-1].get("label", detail)
+            elif open_tools:
+                status = "tool_running"
+                label = "Ejecutando herramienta"
+                detail = list(open_tools.values())[-1].get("label", detail)
+            elif activity.get("active_task_count", 0) <= 0:
+                if activity.get("has_final_message") or activity.get("last_task_completed_at", 0) >= activity.get("last_task_started_at", 0):
+                    status = "final"
+                    label = "Terminado"
+                else:
+                    status = "idle"
+                    label = "Sin actividad"
+
+        activity["status"] = status
+        activity["label"] = label
+        activity["detail"] = detail
+        activity["timestamp"] = timestamp
+        return self._snapshot_codex_activity(activity)
 
     def _extract_codex_text(self, content: List[Dict]) -> str:
         """Extrae texto visible de mensajes del rollout de Codex CLI."""
@@ -432,6 +1020,19 @@ class JSONLParser:
                 if msg.get("text")
             ]
 
+        if session.raw_state.get("copilot_messages"):
+            return [
+                ChatMessage(
+                    role=msg.get("role", ""),
+                    text=msg.get("text", ""),
+                    timestamp=msg.get("timestamp", 0),
+                    request_index=msg.get("index", 0),
+                    is_complete=True
+                )
+                for msg in session.raw_state.get("copilot_messages", [])
+                if msg.get("text")
+            ]
+
         messages = []
         
         for i, req in enumerate(session.requests):
@@ -464,15 +1065,81 @@ class JSONLParser:
         
         return messages
 
+    def get_agent_activity(self, session: SessionState) -> Optional[Dict[str, Any]]:
+        """Obtiene el snapshot actual de actividad del agente para la sesión."""
+        activity = session.raw_state.get("codex_activity")
+        if isinstance(activity, dict):
+            return self._snapshot_codex_activity(activity)
+        activity = session.raw_state.get("copilot_activity")
+        if isinstance(activity, dict):
+            return self._snapshot_activity(activity)
+        return None
+
+    def get_codex_activity(self, session: SessionState) -> Optional[Dict[str, Any]]:
+        """Compatibilidad con código existente."""
+        activity = session.raw_state.get("codex_activity")
+        if not isinstance(activity, dict):
+            return None
+        return self._snapshot_codex_activity(activity)
+
+    def get_session_metadata(self, session: SessionState) -> Dict[str, Any]:
+        """Obtiene metadatos persistibles y listos para la UI."""
+        raw_state = session.raw_state if isinstance(session.raw_state, dict) else {}
+
+        if isinstance(raw_state.get("copilot_meta"), dict):
+            meta = dict(raw_state.get("copilot_meta", {}))
+            models_used = meta.get("models_used", raw_state.get("copilot_models", []))
+            if not isinstance(models_used, list):
+                models_used = []
+            cwd = meta.get("cwd") or meta.get("git_root") or ""
+            return {
+                "source_kind": "copilot",
+                "cwd": meta.get("cwd", ""),
+                "cwd_name": Path(cwd).name if cwd else "",
+                "git_root": meta.get("git_root", ""),
+                "branch": meta.get("branch", ""),
+                "repository": meta.get("repository", ""),
+                "model": meta.get("model", ""),
+                "models_used": models_used,
+                "producer": meta.get("producer", ""),
+                "copilot_version": meta.get("copilot_version", ""),
+            }
+
+        if isinstance(raw_state.get("codex_meta"), dict):
+            meta = dict(raw_state.get("codex_meta", {}))
+            cwd = meta.get("cwd", "")
+            return {
+                "source_kind": "codex",
+                "cwd": cwd,
+                "cwd_name": Path(cwd).name if cwd else "",
+                "git_root": meta.get("git_root", ""),
+                "branch": meta.get("branch", ""),
+                "repository": meta.get("repository", ""),
+                "model": meta.get("model", ""),
+                "models_used": [],
+            }
+
+        return {
+            "source_kind": "",
+            "cwd": "",
+            "cwd_name": "",
+            "git_root": "",
+            "branch": "",
+            "repository": "",
+            "model": "",
+            "models_used": [],
+        }
+
 
 # IDEs soportados
 SUPPORTED_IDES = {
-    "all": {"name": "Todos", "folders": ["Code - Insiders", "Code"], "include_cursor": True, "include_kiro": True, "include_codex": True},
-    "vscode-insiders": {"name": "VS Code Insiders", "folders": ["Code - Insiders"], "include_cursor": False, "include_kiro": False, "include_codex": False},
-    "vscode": {"name": "VS Code", "folders": ["Code"], "include_cursor": False, "include_kiro": False, "include_codex": False},
-    "cursor": {"name": "Cursor", "folders": [], "include_cursor": True, "include_kiro": False, "include_codex": False},
-    "kiro": {"name": "Kiro", "folders": [], "include_cursor": False, "include_kiro": True, "include_codex": False},
-    "codex": {"name": "Codex CLI", "folders": [], "include_cursor": False, "include_kiro": False, "include_codex": True},
+    "all": {"name": "Todos", "folders": ["Code - Insiders", "Code"], "include_cursor": True, "include_kiro": True, "include_codex": True, "include_copilot": True},
+    "vscode-insiders": {"name": "VS Code Insiders", "folders": ["Code - Insiders"], "include_cursor": False, "include_kiro": False, "include_codex": False, "include_copilot": False},
+    "vscode": {"name": "VS Code", "folders": ["Code"], "include_cursor": False, "include_kiro": False, "include_codex": False, "include_copilot": False},
+    "cursor": {"name": "Cursor", "folders": [], "include_cursor": True, "include_kiro": False, "include_codex": False, "include_copilot": False},
+    "kiro": {"name": "Kiro", "folders": [], "include_cursor": False, "include_kiro": True, "include_codex": False, "include_copilot": False},
+    "codex": {"name": "Codex CLI", "folders": [], "include_cursor": False, "include_kiro": False, "include_codex": True, "include_copilot": False},
+    "copilot": {"name": "Copilot CLI", "folders": [], "include_cursor": False, "include_kiro": False, "include_codex": False, "include_copilot": True},
 }
 
 
@@ -483,18 +1150,15 @@ def find_most_recent_session_file(ide_filter: str = "all") -> Optional[Path]:
     Args:
         ide_filter: "all", "vscode-insiders", "vscode", o "cursor"
     """
-    import os
     import logging
     logger = logging.getLogger(__name__)
-    
-    appdata = Path(os.environ.get("APPDATA", ""))
-    userprofile = Path(os.environ.get("USERPROFILE", ""))
     
     # Obtener configuración según filtro
     ide_config = SUPPORTED_IDES.get(ide_filter, SUPPORTED_IDES["all"])
     folders = ide_config["folders"]
     include_cursor = ide_config.get("include_cursor", False)
     include_codex = ide_config.get("include_codex", False)
+    include_copilot = ide_config.get("include_copilot", False)
     
     logger.debug(f"[FIND] Filtro: {ide_filter}, folders: {folders}, cursor: {include_cursor}")
     
@@ -502,8 +1166,7 @@ def find_most_recent_session_file(ide_filter: str = "all") -> Optional[Path]:
     best_mtime = 0
     
     # Buscar en VS Code / VS Code Insiders
-    for folder in folders:
-        ws_storage = appdata / folder / "User" / "workspaceStorage"
+    for ws_storage in get_workspace_storage_roots(folders):
         if not ws_storage.exists():
             logger.debug(f"[FIND] No existe: {ws_storage}")
             continue
@@ -517,19 +1180,17 @@ def find_most_recent_session_file(ide_filter: str = "all") -> Optional[Path]:
                 logger.debug(f"[FIND] Candidato VS Code: {jsonl_file}")
     
     # También buscar en globalStorage para sesiones sin workspace (solo VS Code)
-    for folder in folders:
-        if folder in ["Code - Insiders", "Code"]:
-            empty_sessions = appdata / folder / "User" / "globalStorage" / "emptyWindowChatSessions"
-            if empty_sessions.exists():
-                for jsonl_file in empty_sessions.glob("*.jsonl"):
-                    mtime = jsonl_file.stat().st_mtime
-                    if mtime > best_mtime:
-                        best_mtime = mtime
-                        best_file = jsonl_file
+    for empty_sessions in get_empty_window_chat_roots(folders):
+        if empty_sessions.exists():
+            for jsonl_file in empty_sessions.glob("*.jsonl"):
+                mtime = jsonl_file.stat().st_mtime
+                if mtime > best_mtime:
+                    best_mtime = mtime
+                    best_file = jsonl_file
     
     # Buscar en Cursor (ubicación diferente: ~/.cursor/projects/*/agent-transcripts/*/*.jsonl)
     if include_cursor:
-        cursor_projects = userprofile / ".cursor" / "projects"
+        cursor_projects = get_cursor_projects_dir()
         if cursor_projects.exists():
             logger.debug(f"[FIND] Buscando en Cursor: {cursor_projects}")
             for jsonl_file in cursor_projects.glob("*/agent-transcripts/*/*.jsonl"):
@@ -546,7 +1207,7 @@ def find_most_recent_session_file(ide_filter: str = "all") -> Optional[Path]:
 
     # Buscar en Codex CLI (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl)
     if include_codex:
-        codex_sessions = userprofile / ".codex" / "sessions"
+        codex_sessions = get_codex_sessions_dir()
         if codex_sessions.exists():
             logger.debug(f"[FIND] Buscando en Codex: {codex_sessions}")
             day_dirs = [path for path in codex_sessions.glob("*/*/*") if path.is_dir()]
@@ -560,6 +1221,22 @@ def find_most_recent_session_file(ide_filter: str = "all") -> Optional[Path]:
                         logger.debug(f"[FIND] Candidato Codex: {jsonl_file}")
         else:
             logger.debug(f"[FIND] No existe carpeta Codex: {codex_sessions}")
+
+    if include_copilot:
+        copilot_sessions = get_copilot_session_state_dir()
+        if copilot_sessions.exists():
+            logger.debug(f"[FIND] Buscando en Copilot CLI: {copilot_sessions}")
+            for jsonl_file in copilot_sessions.glob("*/events.jsonl"):
+                try:
+                    mtime = jsonl_file.stat().st_mtime
+                except FileNotFoundError:
+                    continue
+                if mtime > best_mtime:
+                    best_mtime = mtime
+                    best_file = jsonl_file
+                    logger.debug(f"[FIND] Candidato Copilot CLI: {jsonl_file}")
+        else:
+            logger.debug(f"[FIND] No existe carpeta Copilot CLI: {copilot_sessions}")
     
     # No loguear cada selección - se llama cientos de veces por minuto
     # if best_file:

@@ -13,6 +13,8 @@ from typing import Optional, Dict, List, Any
 from dataclasses import dataclass
 import logging
 
+from platform_paths import get_kiro_history_dir
+
 logger = logging.getLogger(__name__)
 
 
@@ -128,10 +130,7 @@ def find_most_recent_kiro_session() -> Optional[Path]:
     Returns:
         Path al archivo JSON más reciente o None
     """
-    import os
-    
-    appdata = Path(os.environ.get("APPDATA", ""))
-    history_dir = appdata / "Kiro" / "User" / "History"
+    history_dir = get_kiro_history_dir()
     
     if not history_dir.exists():
         logger.debug(f"[Kiro] No existe directorio: {history_dir}")
@@ -171,10 +170,7 @@ def get_all_kiro_session_files() -> List[Path]:
     Returns:
         Lista de Paths a archivos JSON
     """
-    import os
-    
-    appdata = Path(os.environ.get("APPDATA", ""))
-    history_dir = appdata / "Kiro" / "User" / "History"
+    history_dir = get_kiro_history_dir()
     
     if not history_dir.exists():
         return []

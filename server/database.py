@@ -19,11 +19,15 @@ from typing import Optional, List, Dict, Any
 from dataclasses import dataclass, asdict
 from contextlib import contextmanager
 
+from cryptography.fernet import Fernet, InvalidToken
+
 logger = logging.getLogger(__name__)
 
 # Ubicación de la base de datos
 DB_DIR = Path(__file__).parent.parent / "data"
 DB_PATH = DB_DIR / "vibe_voice.db"
+SETTINGS_KEY_PATH = DB_DIR / ".settings.key"
+ENCRYPTED_PREFIX = "enc:"
 
 
 @dataclass
@@ -51,6 +55,14 @@ class SessionRecord:
     created_at: str = ""
     updated_at: str = ""
     message_count: int = 0
+    cwd: str = ""
+    git_root: str = ""
+    branch: str = ""
+    repository: str = ""
+    model: str = ""
+    models_used: str = ""
+    archived: bool = False
+    archived_at: str = ""
 
 
 class Database:
@@ -69,17 +81,87 @@ class Database:
             return
         self._initialized = True
         self._ensure_db_dir()
+        self._cipher = self._build_cipher()
         self._init_db()
+        self._migrate_legacy_encrypted_settings()
     
     def _ensure_db_dir(self):
         """Crea el directorio de datos si no existe."""
         DB_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(DB_DIR, 0o700)
+        except OSError:
+            pass
+
+    def _build_cipher(self) -> Fernet:
+        """Construye el cifrador para secretos persistidos."""
+        env_key = os.getenv("VIBE_VOICE_SETTINGS_KEY", "").strip()
+        if env_key:
+            key_bytes = env_key.encode("utf-8")
+        else:
+            if not SETTINGS_KEY_PATH.exists():
+                SETTINGS_KEY_PATH.write_bytes(Fernet.generate_key())
+                try:
+                    os.chmod(SETTINGS_KEY_PATH, 0o600)
+                except OSError:
+                    pass
+            key_bytes = SETTINGS_KEY_PATH.read_bytes().strip()
+        return Fernet(key_bytes)
+
+    def _serialize_setting(self, value: Any) -> str:
+        return json.dumps(value) if not isinstance(value, str) else value
+
+    def _encrypt_setting_value(self, value_str: str) -> str:
+        token = self._cipher.encrypt(value_str.encode("utf-8")).decode("utf-8")
+        return f"{ENCRYPTED_PREFIX}{token}"
+
+    def _decrypt_setting_value(self, value_str: str, encrypted: bool) -> str:
+        if not encrypted:
+            return value_str
+        if not value_str.startswith(ENCRYPTED_PREFIX):
+            return value_str
+        token = value_str[len(ENCRYPTED_PREFIX):].encode("utf-8")
+        return self._cipher.decrypt(token).decode("utf-8")
+
+    def _decode_setting_value(self, value_str: str, encrypted: bool) -> Any:
+        raw_value = self._decrypt_setting_value(value_str, encrypted)
+        try:
+            return json.loads(raw_value)
+        except json.JSONDecodeError:
+            return raw_value
+
+    def _migrate_legacy_encrypted_settings(self):
+        """Convierte settings marcados como encrypted pero aún guardados en claro."""
+        migrated = 0
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT key, value FROM settings WHERE encrypted = 1")
+            rows = cursor.fetchall()
+            for row in rows:
+                value_str = row["value"]
+                if isinstance(value_str, str) and value_str.startswith(ENCRYPTED_PREFIX):
+                    continue
+                cursor.execute(
+                    "UPDATE settings SET value = ?, updated_at = ? WHERE key = ?",
+                    (
+                        self._encrypt_setting_value(value_str),
+                        datetime.now().isoformat(),
+                        row["key"],
+                    )
+                )
+                migrated += 1
+        if migrated:
+            logger.info(f"[DB] Settings sensibles migrados a cifrado real: {migrated}")
     
     @contextmanager
     def _get_connection(self):
         """Context manager para conexiones a la base de datos."""
         conn = sqlite3.connect(str(DB_PATH), timeout=10)
         conn.row_factory = sqlite3.Row
+        try:
+            os.chmod(DB_PATH, 0o600)
+        except OSError:
+            pass
         try:
             yield conn
             conn.commit()
@@ -103,7 +185,15 @@ class Database:
                     source_file TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    message_count INTEGER DEFAULT 0
+                    message_count INTEGER DEFAULT 0,
+                    cwd TEXT NOT NULL DEFAULT '',
+                    git_root TEXT NOT NULL DEFAULT '',
+                    branch TEXT NOT NULL DEFAULT '',
+                    repository TEXT NOT NULL DEFAULT '',
+                    model TEXT NOT NULL DEFAULT '',
+                    models_used TEXT NOT NULL DEFAULT '',
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    archived_at TEXT NOT NULL DEFAULT ''
                 )
             """)
             
@@ -139,8 +229,35 @@ class Database:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_role ON messages(role)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_ide ON sessions(ide)")
+            self._migrate_session_columns(cursor)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_archived ON sessions(archived)")
             
             logger.info(f"[DB] Base de datos inicializada: {DB_PATH}")
+        try:
+            os.chmod(DB_PATH, 0o600)
+        except OSError:
+            pass
+
+    def _migrate_session_columns(self, cursor):
+        """Agrega columnas nuevas a sessions sin romper bases existentes."""
+        cursor.execute("PRAGMA table_info(sessions)")
+        existing_columns = {row["name"] for row in cursor.fetchall()}
+        desired_columns = {
+            "cwd": "TEXT NOT NULL DEFAULT ''",
+            "git_root": "TEXT NOT NULL DEFAULT ''",
+            "branch": "TEXT NOT NULL DEFAULT ''",
+            "repository": "TEXT NOT NULL DEFAULT ''",
+            "model": "TEXT NOT NULL DEFAULT ''",
+            "models_used": "TEXT NOT NULL DEFAULT ''",
+            "archived": "INTEGER NOT NULL DEFAULT 0",
+            "archived_at": "TEXT NOT NULL DEFAULT ''",
+        }
+
+        for column_name, column_def in desired_columns.items():
+            if column_name in existing_columns:
+                continue
+            cursor.execute(f"ALTER TABLE sessions ADD COLUMN {column_name} {column_def}")
+            logger.info(f"[DB] Columna migrada en sessions: {column_name}")
     
     # ══════════════════════════════════════════════════════════════════════════════
     # SESIONES
@@ -168,21 +285,44 @@ class Database:
             if row:
                 return SessionRecord(**dict(row))
             return None
+
+    def get_session_by_source(self, source_file: str) -> Optional[SessionRecord]:
+        """Obtiene una sesión por su archivo fuente."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM sessions WHERE source_file = ?", (source_file,))
+            row = cursor.fetchone()
+            if row:
+                return SessionRecord(**dict(row))
+            return None
     
-    def get_sessions(self, limit: int = 50, offset: int = 0, ide: str = None) -> List[SessionRecord]:
+    def get_sessions(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        ide: str = None,
+        archived: Optional[bool] = False,
+    ) -> List[SessionRecord]:
         """Lista sesiones ordenadas por fecha de actualización."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
+            clauses = []
+            params = []
+
             if ide:
-                cursor.execute("""
-                    SELECT * FROM sessions WHERE ide = ?
-                    ORDER BY updated_at DESC LIMIT ? OFFSET ?
-                """, (ide, limit, offset))
-            else:
-                cursor.execute("""
-                    SELECT * FROM sessions 
-                    ORDER BY updated_at DESC LIMIT ? OFFSET ?
-                """, (limit, offset))
+                clauses.append("ide = ?")
+                params.append(ide)
+            if archived is True:
+                clauses.append("archived = 1")
+            elif archived is False:
+                clauses.append("archived = 0")
+
+            query = "SELECT * FROM sessions"
+            if clauses:
+                query += " WHERE " + " AND ".join(clauses)
+            query += " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+            cursor.execute(query, params)
             return [SessionRecord(**dict(row)) for row in cursor.fetchall()]
     
     def get_or_create_session_by_source(self, source_file: str, ide: str = "") -> int:
@@ -218,6 +358,71 @@ class Database:
             cursor.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             cursor.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             logger.info(f"[DB] Sesión eliminada: {session_id}")
+
+    def replace_session_messages(
+        self,
+        session_id: int,
+        messages: List[Dict[str, Any]],
+        *,
+        name: Optional[str] = None,
+        ide: Optional[str] = None,
+        source_file: Optional[str] = None,
+        session_fields: Optional[Dict[str, Any]] = None,
+    ):
+        """Reemplaza todos los mensajes de una sesión usando un snapshot completo."""
+        now = datetime.now().isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+
+            for msg in messages:
+                cursor.execute("""
+                    INSERT INTO messages
+                    (session_id, role, text, request_index, timestamp, ide, has_thinking, thinking_text, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    session_id,
+                    msg.get("role", ""),
+                    msg.get("text", ""),
+                    msg.get("request_index", 0),
+                    msg.get("timestamp", ""),
+                    msg.get("ide", ""),
+                    1 if msg.get("has_thinking", False) else 0,
+                    msg.get("thinking_text", ""),
+                    now,
+                ))
+
+            updates = {
+                "updated_at": now,
+                "message_count": len(messages),
+            }
+            if name is not None:
+                updates["name"] = name
+            if ide is not None:
+                updates["ide"] = ide
+            if source_file is not None:
+                updates["source_file"] = source_file
+            if session_fields:
+                for key, value in session_fields.items():
+                    if value is None:
+                        continue
+                    updates[key] = value
+
+            fields = ", ".join(f"{key} = ?" for key in updates.keys())
+            values = list(updates.values()) + [session_id]
+            cursor.execute(f"UPDATE sessions SET {fields} WHERE id = ?", values)
+
+    def set_session_archived(self, session_id: int, archived: bool) -> None:
+        """Archiva o desarchiva una sesión."""
+        now = datetime.now().isoformat()
+        archived_at = now if archived else ""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE sessions
+                SET archived = ?, archived_at = ?, updated_at = ?
+                WHERE id = ?
+            """, (1 if archived else 0, archived_at, now, session_id))
     
     # ══════════════════════════════════════════════════════════════════════════════
     # MENSAJES
@@ -300,15 +505,28 @@ class Database:
                 created_at=row["created_at"]
             ) for row in cursor.fetchall()]
     
-    def search_messages(self, query: str, limit: int = 50) -> List[MessageRecord]:
+    def search_messages(
+        self,
+        query: str,
+        limit: int = 50,
+        archived: Optional[bool] = False,
+    ) -> List[MessageRecord]:
         """Busca mensajes por texto."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM messages 
-                WHERE text LIKE ? OR thinking_text LIKE ?
-                ORDER BY created_at DESC LIMIT ?
-            """, (f"%{query}%", f"%{query}%", limit))
+            sql = """
+                SELECT m.* FROM messages m
+                JOIN sessions s ON s.id = m.session_id
+                WHERE (m.text LIKE ? OR m.thinking_text LIKE ?)
+            """
+            params = [f"%{query}%", f"%{query}%"]
+            if archived is True:
+                sql += " AND s.archived = 1"
+            elif archived is False:
+                sql += " AND s.archived = 0"
+            sql += " ORDER BY m.created_at DESC LIMIT ?"
+            params.append(limit)
+            cursor.execute(sql, params)
             return [MessageRecord(
                 id=row["id"],
                 session_id=row["session_id"],
@@ -342,7 +560,9 @@ class Database:
     def set_setting(self, key: str, value: Any, encrypted: bool = False):
         """Guarda una configuración."""
         now = datetime.now().isoformat()
-        value_str = json.dumps(value) if not isinstance(value, str) else value
+        value_str = self._serialize_setting(value)
+        if encrypted:
+            value_str = self._encrypt_setting_value(value_str)
         
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -355,13 +575,14 @@ class Database:
         """Obtiene una configuración."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            cursor.execute("SELECT value, encrypted FROM settings WHERE key = ?", (key,))
             row = cursor.fetchone()
             if row:
                 try:
-                    return json.loads(row["value"])
-                except json.JSONDecodeError:
-                    return row["value"]
+                    return self._decode_setting_value(row["value"], bool(row["encrypted"]))
+                except InvalidToken:
+                    logger.error(f"[DB] No se pudo descifrar setting '{key}'")
+                    return default
             return default
     
     def get_all_settings(self) -> Dict[str, Any]:
@@ -372,9 +593,9 @@ class Database:
             settings = {}
             for row in cursor.fetchall():
                 try:
-                    settings[row["key"]] = json.loads(row["value"])
-                except json.JSONDecodeError:
-                    settings[row["key"]] = row["value"]
+                    settings[row["key"]] = self._decode_setting_value(row["value"], bool(row["encrypted"]))
+                except InvalidToken:
+                    logger.error(f"[DB] No se pudo descifrar setting '{row['key']}'")
             return settings
     
     def delete_setting(self, key: str):
@@ -453,6 +674,12 @@ class Database:
             
             cursor.execute("SELECT COUNT(*) as count FROM sessions")
             total_sessions = cursor.fetchone()["count"]
+
+            cursor.execute("SELECT COUNT(*) as count FROM sessions WHERE archived = 0")
+            active_sessions = cursor.fetchone()["count"]
+
+            cursor.execute("SELECT COUNT(*) as count FROM sessions WHERE archived = 1")
+            archived_sessions = cursor.fetchone()["count"]
             
             cursor.execute("SELECT COUNT(*) as count FROM messages")
             total_messages = cursor.fetchone()["count"]
@@ -471,6 +698,8 @@ class Database:
             
             return {
                 "total_sessions": total_sessions,
+                "active_sessions": active_sessions,
+                "archived_sessions": archived_sessions,
                 "total_messages": total_messages,
                 "sessions_by_ide": sessions_by_ide,
                 "messages_by_role": messages_by_role,

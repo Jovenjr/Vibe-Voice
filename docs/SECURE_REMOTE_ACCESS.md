@@ -1,17 +1,29 @@
-# Acceso remoto seguro
+# Acceso remoto seguro para Vibe Voice
 
-La forma recomendada de exponer Vibe Voice es:
+Esta guia resume como exponer Vibe Voice minimizando riesgo.
 
-1. Ejecutar Vibe Voice solo en loopback.
-2. Publicar un proxy HTTPS delante.
-3. Restringir acceso por IP en el proxy y/o firewall.
+## Clausula de seguridad y uso responsable
 
-## Puertos internos
+Al habilitar acceso remoto, TTS/STT y canales de entrada (web/Telegram/bridge), estas ampliando la superficie de control sobre tu entorno de desarrollo.
+
+Usalo solo en equipos y redes confiables, con controles de acceso estrictos y credenciales bien protegidas.
+
+## Principios base
+
+1. Ejecuta Vibe Voice solo en loopback (`127.0.0.1`).
+2. Publica hacia Internet unicamente detras de HTTPS reverse proxy.
+3. Restringe por IP/CIDR permitida.
+4. Nunca expongas puertos internos directos.
+
+## Puertos internos esperados
 
 - UI HTTP: `127.0.0.1:8080`
 - WebSocket: `127.0.0.1:8765`
+- Bridge local Windows: `127.0.0.1:8766` (solo local)
 
 ## Arranque recomendado
+
+Modo general (todos los IDE soportados):
 
 ```bash
 cd /opt/Vibe-Voice
@@ -19,70 +31,97 @@ source .venv/bin/activate
 python server/main.py --host 127.0.0.1 --ui-host 127.0.0.1 --ide all
 ```
 
-Si solo quieres sesiones de Codex CLI, puedes usar:
+Modo Codex CLI rapido:
 
 ```bash
 ./run_codex_linux.sh --host 127.0.0.1 --ui-host 127.0.0.1
 ```
 
-## Nginx
+## Nginx (template seguro)
 
-Hay una config base en:
+Template versionado:
 
-`deploy/nginx/vibe-voice.conf`
+- `deploy/nginx/vibe-voice.conf`
 
-Esa config:
+Ese archivo incluye:
 
-- expone solo `443`
-- redirige `80` a `HTTPS`
-- hace proxy de `/` a `127.0.0.1:8080`
-- hace proxy de `/ws` a `127.0.0.1:8765`
-- trae una IP de ejemplo (`203.0.113.10`) para allowlist
+- redirect HTTP -> HTTPS
+- proxy de `/` a `127.0.0.1:8080`
+- proxy de `/ws` a `127.0.0.1:8765`
+- allowlist por IP/CIDR con valores de ejemplo (`203.0.113.10`)
 
-> Importante: en repositorio público no dejes IPs reales de tu infraestructura.
-> Edita `deploy/nginx/vibe-voice.conf` en tu servidor con tu IP/CIDR y evita
-> commitear esos valores sensibles.
+> Importante para repositorio publico: nunca subas IPs reales de infraestructura.
 
-## UFW
-
-Aunque Nginx ya restringe por IP, conviene cerrar el resto:
+## Firewall (UFW)
 
 ```bash
 sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
 sudo ufw deny 8080/tcp
 sudo ufw deny 8765/tcp
+sudo ufw deny 8766/tcp
 ```
 
-Si no quieres exponer `80`, puedes cerrarlo despues de emitir el certificado.
-
-## Certificados
-
-Si usas un dominio con Let's Encrypt:
+## Certificados TLS
 
 ```bash
 sudo apt update
 sudo apt install -y nginx certbot python3-certbot-nginx
-```
-
-Luego:
-
-```bash
 sudo certbot --nginx -d tu-dominio
 ```
 
-Despues actualiza en `deploy/nginx/vibe-voice.conf`:
+Actualiza luego:
 
 - `server_name`
 - `ssl_certificate`
 - `ssl_certificate_key`
 
-## Verificacion
+## Riesgos especificos y mitigaciones
 
-Desde tu IP permitida:
+### 1) Telegram input habilitado
+
+Riesgo: entrada remota al flujo local.
+
+Mitigaciones:
+
+- Define `TELEGRAM_CHAT_ID` estricto.
+- Protege `TELEGRAM_BOT_TOKEN`.
+- Desactiva Telegram input cuando no lo uses.
+
+### 2) Bridge local de pegado (Windows)
+
+Riesgo: inyeccion de texto en ventana activa local.
+
+Mitigaciones:
+
+- Mantenerlo en localhost (`127.0.0.1`) siempre.
+- No tunelarlo ni exponerlo externamente.
+- Ejecutarlo solo cuando se necesite.
+
+### 3) Secrets y configuracion
+
+Riesgo: fuga de API keys/tokens.
+
+Mitigaciones:
+
+- No commitear `.env`.
+- Usar settings cifrados en DB para claves sensibles.
+- Definir `VIBE_VOICE_SETTINGS_KEY` en despliegues controlados.
+
+## Verificacion operativa
+
+Desde IP autorizada:
 
 ```bash
 curl -I https://tu-dominio
 ```
 
-Desde otra IP, el resultado esperado es `403 Forbidden`.
+Desde IP no autorizada, deberias obtener `403 Forbidden`.
+
+## Checklist antes de publicar cambios
+
+1. `git status` limpio de secretos/artefactos locales.
+2. Sin tokens reales en codigo, docs o configs.
+3. `deploy/nginx/vibe-voice.conf` solo con ejemplos.
+4. Puertos internos no expuestos publicamente.
+5. Revisado `SECURITY.md`.

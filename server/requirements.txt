@@ -3,3 +3,6 @@ watchdog>=4.0.0
 edge-tts>=6.1.0
 ollama>=0.1.0
 python-dotenv>=1.0.1
+groq>=1.1.0
+cryptography>=46.0.0
+google-genai>=1.30.0

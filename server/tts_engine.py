@@ -22,6 +22,7 @@ import os
 import re
 import hashlib
 import time
+import sys
 from pathlib import Path
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -34,11 +35,17 @@ logger = logging.getLogger(__name__)
 
 try:
     import edge_tts
-    import pygame
     EDGE_TTS_AVAILABLE = True
 except ImportError:
     EDGE_TTS_AVAILABLE = False
-    logger.warning("edge-tts o pygame no disponible")
+    logger.warning("edge-tts no disponible")
+
+try:
+    import pygame
+    PYGAME_AVAILABLE = True
+except ImportError:
+    PYGAME_AVAILABLE = False
+    logger.warning("pygame no disponible")
 
 try:
     import numpy as np
@@ -146,13 +153,18 @@ class ServerTTS:
         self._edge_rate:   str   = "+0%"
         self.rate = "+0%"
 
-        # ── Docker mode ───────────────────────────────────────────────────────
+        # ── Browser playback mode ────────────────────────────────────────────
         self.docker_mode      = os.environ.get("DOCKER_MODE") == "1"
+        browser_playback_env  = os.environ.get("TTS_BROWSER_PLAYBACK")
+        if browser_playback_env is None:
+            self.browser_audio_mode = self.docker_mode or sys.platform != "win32"
+        else:
+            self.browser_audio_mode = browser_playback_env.strip().lower() in {"1", "true", "yes", "on"}
         self.audio_callback   = audio_callback
         self.audio_cache_dir  = Path(__file__).parent / "audio_cache"
-        if self.docker_mode:
+        if self.browser_audio_mode:
             self.audio_cache_dir.mkdir(exist_ok=True)
-            logger.info(f"[TTS] Modo Docker: audio en {self.audio_cache_dir}")
+            logger.info(f"[TTS] Modo navegador: audio en {self.audio_cache_dir}")
 
         # ── LLM ───────────────────────────────────────────────────────────────
         self.llm_enabled   = True
@@ -195,7 +207,7 @@ class ServerTTS:
 
         # ── Pygame ────────────────────────────────────────────────────────────
         # edge-tts genera a 24000 Hz — usar el mismo rate evita resampling y pérdida de calidad
-        if EDGE_TTS_AVAILABLE and not self.docker_mode:
+        if EDGE_TTS_AVAILABLE and PYGAME_AVAILABLE and not self.browser_audio_mode:
             try:
                 pygame.mixer.init(frequency=24000, size=-16, channels=1, buffer=1024)
             except Exception as e:
@@ -217,7 +229,7 @@ class ServerTTS:
             target=self._generator_loop, daemon=True, name="TTS-Generator")
         self._generator_thread.start()
 
-        if not self.docker_mode:
+        if not self.browser_audio_mode:
             self._player_thread = threading.Thread(
                 target=self._player_loop, daemon=True, name="TTS-Player")
             self._player_thread.start()
@@ -235,7 +247,7 @@ class ServerTTS:
             self._player_thread.join(timeout=2)
         if self._llm_executor:
             self._llm_executor.shutdown(wait=False)
-        if EDGE_TTS_AVAILABLE and not self.docker_mode:
+        if EDGE_TTS_AVAILABLE and PYGAME_AVAILABLE and not self.browser_audio_mode:
             try:
                 pygame.mixer.quit()
             except Exception:
@@ -269,7 +281,7 @@ class ServerTTS:
                                 daemon=True
                             ).start()
                         
-                        if self.docker_mode:
+                        if self.browser_audio_mode:
                             self._handle_docker_audio(item)
                         else:
                             self._audio_ready_queue.put(item)
@@ -483,14 +495,20 @@ class ServerTTS:
 
     # ── Docker mode ───────────────────────────────────────────────────────────
 
+    def _audio_key(self, text: str) -> str:
+        normalized = _clean_markdown(self._clean_text(text)).lower()
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
     def _handle_docker_audio(self, item: AudioItem):
         try:
             audio_id   = hashlib.sha256(f"{item.text}{time.time()}".encode()).hexdigest()[:12]
+            audio_key  = self._audio_key(item.text)
             audio_file = self.audio_cache_dir / f"{audio_id}.mp3"
             audio_file.write_bytes(item.audio_bytes)
             self._cleanup_old_audio()
             if self.audio_callback:
-                self.audio_callback(f"/audio/{audio_id}.mp3")
+                self.audio_callback(f"/audio/{audio_id}.mp3", audio_key)
         except Exception as e:
             logger.error(f"[TTS] Error guardando audio Docker: {e}")
 
@@ -560,7 +578,11 @@ class ServerTTS:
         return [{"index": v["index"], "name": v["display"]} for v in self.VOICES]
 
     def pause(self):
-        if EDGE_TTS_AVAILABLE and not self.docker_mode:
+        if self.browser_audio_mode:
+            self._paused = True
+            logger.info("[TTS] Pausado (cliente navegador)")
+            return True
+        if EDGE_TTS_AVAILABLE and PYGAME_AVAILABLE and not self.browser_audio_mode:
             try:
                 if self._active_channel:
                     self._active_channel.pause()
@@ -572,7 +594,11 @@ class ServerTTS:
         return False
 
     def resume(self):
-        if EDGE_TTS_AVAILABLE and not self.docker_mode:
+        if self.browser_audio_mode:
+            self._paused = False
+            logger.info("[TTS] Reanudado (cliente navegador)")
+            return True
+        if EDGE_TTS_AVAILABLE and PYGAME_AVAILABLE and not self.browser_audio_mode:
             try:
                 if self._active_channel:
                     self._active_channel.unpause()
@@ -584,7 +610,12 @@ class ServerTTS:
         return False
 
     def stop_audio(self):
-        if EDGE_TTS_AVAILABLE and not self.docker_mode:
+        if self.browser_audio_mode:
+            self._paused = False
+            self._clear_all_queues()
+            logger.info("[TTS] Detenido (cliente navegador)")
+            return True
+        if EDGE_TTS_AVAILABLE and PYGAME_AVAILABLE and not self.browser_audio_mode:
             try:
                 if self._active_channel:
                     self._active_channel.stop()
@@ -597,7 +628,12 @@ class ServerTTS:
         return False
 
     def skip_current(self):
-        if EDGE_TTS_AVAILABLE and not self.docker_mode:
+        if self.browser_audio_mode:
+            self._paused = False
+            self._clear_all_queues()
+            logger.info("[TTS] Skip: colas limpiadas (cliente navegador)")
+            return True
+        if EDGE_TTS_AVAILABLE and PYGAME_AVAILABLE and not self.browser_audio_mode:
             try:
                 if self._active_channel:
                     self._active_channel.stop()
@@ -632,7 +668,15 @@ class ServerTTS:
         self._pending_queue = []
 
     def get_playback_status(self):
-        if EDGE_TTS_AVAILABLE and not self.docker_mode:
+        if self.browser_audio_mode:
+            return {
+                "playing": False,
+                "paused": self._paused,
+                "speed": self._speed_float,
+                "queue_size": self.queue.qsize(),
+                "client_mode": True,
+            }
+        if EDGE_TTS_AVAILABLE and PYGAME_AVAILABLE and not self.browser_audio_mode:
             try:
                 is_busy = (self._active_channel is not None and self._active_channel.get_busy())
                 return {
@@ -640,10 +684,11 @@ class ServerTTS:
                     "paused":     self._paused,
                     "speed":      self._speed_float,
                     "queue_size": self._audio_ready_queue.qsize() if hasattr(self, '_audio_ready_queue') else 0,
+                    "client_mode": False,
                 }
             except Exception:
                 pass
-        return {"playing": False, "paused": False, "speed": self._speed_float, "queue_size": 0}
+        return {"playing": False, "paused": False, "speed": self._speed_float, "queue_size": 0, "client_mode": self.browser_audio_mode}
 
     # ── Procesamiento de texto ────────────────────────────────────────────────
 
@@ -749,6 +794,17 @@ class ServerTTS:
         if self.llm:
             self.llm.set_enabled(enabled)
         logger.info(f"[TTS] LLM: {'activado' if enabled else 'desactivado'}")
+
+    def configure_llm(self, api_key: str = None, model: str = None):
+        """Actualiza la configuración runtime del preprocesado LLM."""
+        if not self.llm:
+            if LLM_AVAILABLE:
+                self.llm = LLMProcessor(model=model, enabled=self.llm_enabled, api_key=api_key)
+            return
+        if model:
+            self.llm.set_model(model)
+        if api_key is not None:
+            self.llm.set_api_key(api_key)
 
     # ── Telegram ──────────────────────────────────────────────────────────────
 

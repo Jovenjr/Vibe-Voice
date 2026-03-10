@@ -24,8 +24,8 @@ else:
     load_dotenv()  # Intenta cargar del directorio actual
 
 # Configuración
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+DEFAULT_GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 MAX_INPUT_CHARS = 1500
 TIMEOUT_SECONDS = 15.0
@@ -60,8 +60,9 @@ Transforma el siguiente texto:"""
 class LLMProcessor:
     """Procesa texto con Google Gemini para resumirlo/simplificarlo para TTS."""
 
-    def __init__(self, model: str = None, enabled: bool = True):
-        self.model = model or GEMINI_MODEL
+    def __init__(self, model: str = None, enabled: bool = True, api_key: str = None):
+        self.model = model or DEFAULT_GEMINI_MODEL
+        self.api_key = api_key or DEFAULT_GEMINI_API_KEY or ""
         self.enabled = enabled
         self._client = None
         self._available = False
@@ -76,14 +77,14 @@ class LLMProcessor:
     def _init_gemini(self):
         """Inicializa el cliente de Gemini."""
         try:
-            if not GEMINI_API_KEY:
-                logger.error("[LLM] GEMINI_API_KEY no encontrada en .env")
+            if not self.api_key:
+                logger.error("[LLM] GEMINI_API_KEY no configurada")
                 self._available = False
                 return
 
             from google import genai
             self._genai = genai
-            self._client = genai.Client(api_key=GEMINI_API_KEY)
+            self._client = genai.Client(api_key=self.api_key)
             self._available = True
             logger.info(f"[LLM] Gemini '{self.model}' listo")
 
@@ -187,4 +188,15 @@ class LLMProcessor:
     def set_model(self, model: str):
         """Cambia el modelo."""
         self.model = model
+        if self.enabled:
+            self._init_gemini()
         logger.info(f"[LLM] Modelo cambiado a: {model}")
+
+    def set_api_key(self, api_key: str):
+        """Actualiza la API key y re-inicializa el cliente."""
+        self.api_key = (api_key or "").strip()
+        self._client = None
+        self._available = False
+        if self.enabled:
+            self._init_gemini()
+        logger.info("[LLM] API key actualizada")

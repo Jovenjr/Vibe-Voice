@@ -1,13 +1,12 @@
-﻿"""
+"""
 Demo del soporte de Kiro en Vibe Voice.
 
 Este script demuestra cÃ³mo el sistema detecta y procesa sesiones de Kiro.
 """
 
-import os
 import time
-from pathlib import Path
 from kiro_parser import KiroParser, find_most_recent_kiro_session, get_all_kiro_session_files
+from platform_paths import get_kiro_history_dir
 
 def print_header(text):
     """Imprime un encabezado formateado."""
@@ -19,7 +18,7 @@ def demo_detection():
     """Demuestra la detecciÃ³n de sesiones de Kiro."""
     print_header("1. DETECCIÃ“N DE SESIONES DE KIRO")
     
-    history_dir = Path(os.environ.get("APPDATA", "")) / "Kiro" / "User" / "History"
+    history_dir = get_kiro_history_dir()
     print(f"\nDirectorio de historial: {history_dir}")
     print(f"Existe: {history_dir.exists()}")
     
@@ -193,4 +192,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -1,15 +1,12 @@
-import os
-from pathlib import Path
-from kiro_parser import KiroParser
+from kiro_parser import KiroParser, find_most_recent_kiro_session
 
-# Probar con un archivo específico
-history_dir = Path(os.environ['APPDATA']) / 'Kiro' / 'User' / 'History'
-test_file = history_dir / '-1012eccc' / '96JX.json'
+# Probar con la sesión más reciente disponible
+test_file = find_most_recent_kiro_session()
 
 print(f"Testing file: {test_file}")
-print(f"Exists: {test_file.exists()}")
+print(f"Exists: {bool(test_file and test_file.exists())}")
 
-if test_file.exists():
+if test_file and test_file.exists():
     parser = KiroParser()
     data = parser.parse_file(test_file)
     

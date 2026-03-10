@@ -21,6 +21,15 @@ from watchdog.events import FileSystemEventHandler, FileModifiedEvent
 
 from jsonl_parser import JSONLParser, SessionState, find_most_recent_session_file, SUPPORTED_IDES
 from kiro_parser import KiroParser, find_most_recent_kiro_session, get_all_kiro_session_files
+from platform_paths import (
+    get_copilot_session_state_dir,
+    get_codex_sessions_dir,
+    get_cursor_projects_dir,
+    get_empty_window_chat_roots,
+    get_kiro_history_dir,
+    get_workspace_storage_roots,
+    infer_ide_from_path,
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -63,12 +72,7 @@ class ChatSessionHandler(FileSystemEventHandler):
         self.include_codex_progress = True  # Incluir commentary/progreso visible de Codex
 
     def _current_ide(self) -> str:
-        current = str(self.current_session_file or "").lower()
-        if "\\code - insiders\\" in current:
-            return "vscode-insiders"
-        if "\\code\\user\\" in current:
-            return "vscode"
-        return ""
+        return infer_ide_from_path(self.current_session_file)
 
     def _emit_session_changed(self, file_path: Path):
         self.callback(ChatEvent(
@@ -81,6 +85,15 @@ class ChatSessionHandler(FileSystemEventHandler):
 
     def _emit_latest_snapshot(self, session: SessionState):
         ide = self._current_ide() or "vscode"
+        agent_activity = self.parser.get_agent_activity(session)
+        if ide in {"codex", "copilot"} and agent_activity:
+            self.callback(ChatEvent(
+                event_type="agent_activity",
+                data={
+                    **agent_activity,
+                    "ide": ide,
+                }
+            ))
 
         input_state = session.raw_state.get("inputState", {})
         draft_text = input_state.get("inputText", "") if isinstance(input_state, dict) else ""
@@ -400,6 +413,15 @@ class ChatSessionHandler(FileSystemEventHandler):
                     }
                 ))
 
+            elif op_type == "codex_activity":
+                self.callback(ChatEvent(
+                    event_type="agent_activity",
+                    data={
+                        **op_data,
+                        "ide": "codex",
+                    }
+                ))
+
             elif op_type == "codex_assistant":
                 phase = op_data.get("phase", "")
                 if phase == "commentary" and not self.include_codex_progress:
@@ -419,6 +441,41 @@ class ChatSessionHandler(FileSystemEventHandler):
                         "is_complete": True,
                         "ide": "codex",
                         "phase": phase,
+                    }
+                ))
+
+            elif op_type == "copilot_user":
+                self.callback(ChatEvent(
+                    event_type="user_message",
+                    data={
+                        "text": op_data.get("text", ""),
+                        "request_index": op_data.get("index", 0),
+                        "ide": "copilot",
+                    }
+                ))
+
+            elif op_type == "copilot_activity":
+                self.callback(ChatEvent(
+                    event_type="agent_activity",
+                    data={
+                        **op_data,
+                        "ide": "copilot",
+                    }
+                ))
+
+            elif op_type == "copilot_assistant":
+                text = op_data.get("text", "")
+                if not text:
+                    continue
+                self.callback(ChatEvent(
+                    event_type="response_chunk",
+                    data={
+                        "text": text,
+                        "accumulated_text": text,
+                        "request_index": op_data.get("index", 0),
+                        "is_first": True,
+                        "is_complete": True,
+                        "ide": "copilot",
                     }
                 ))
     
@@ -464,6 +521,7 @@ class CopilotChatWatcher:
         self._poll_thread = None
         self.ide_filter = ide_filter  # "all", "vscode-insiders", "vscode", "cursor", "kiro"
         self._ide_changed = False  # Flag para forzar re-detección en polling
+        self.fixed_session_file: Optional[Path] = None
         self.kiro_parser = KiroParser()  # Parser para archivos JSON de Kiro
         self.kiro_sessions: Dict[str, Dict] = {}  # Cache de sesiones de Kiro
     
@@ -475,6 +533,7 @@ class CopilotChatWatcher:
         
         old_filter = self.ide_filter
         self.ide_filter = ide_filter
+        self.fixed_session_file = None
         ide_name = SUPPORTED_IDES[ide_filter]["name"]
         logger.info(f"[IDE] Cambiado de '{old_filter}' a '{ide_filter}' ({ide_name})")
         
@@ -488,6 +547,41 @@ class CopilotChatWatcher:
         self._ide_changed = True
         
         return {"ide": ide_filter, "name": ide_name}
+
+    def set_session_file(self, file_path: Path) -> Dict[str, str]:
+        """Fija una sesión concreta para seguimiento en vivo."""
+        file_path = Path(file_path)
+        if not file_path.exists():
+            raise FileNotFoundError(file_path)
+
+        self.fixed_session_file = file_path
+        if self.handler:
+            self.handler.current_session_file = None
+            self.handler.file_positions = {}
+            self.handler.file_sizes = {}
+            self.handler.last_response_text.clear()
+            self.handler.last_input_text = ""
+            self.handler.completed_requests.clear()
+        self._ide_changed = True
+        logger.info(f"[SESSION] Fijada sesión manual: {file_path}")
+        return {"file": str(file_path), "mode": "manual"}
+
+    def clear_session_file(self) -> Dict[str, str]:
+        """Vuelve al modo automático usando la sesión más reciente."""
+        self.fixed_session_file = None
+        if self.handler:
+            self.handler.current_session_file = None
+            self.handler.file_positions = {}
+            self.handler.file_sizes = {}
+        self._ide_changed = True
+        logger.info("[SESSION] Modo automático restaurado")
+        return {"mode": "auto"}
+
+    def get_selected_session_file(self) -> Optional[Path]:
+        """Retorna la sesión fijada o la más reciente según el filtro actual."""
+        if self.fixed_session_file and self.fixed_session_file.exists():
+            return self.fixed_session_file
+        return find_most_recent_session_file(self.ide_filter)
     
     def _get_watch_directories(self) -> List[Path]:
         """Obtiene los directorios a monitorear según el IDE seleccionado."""
@@ -499,30 +593,10 @@ class CopilotChatWatcher:
         include_cursor = ide_config.get("include_cursor", False)
         include_kiro = ide_config.get("include_kiro", False)
         include_codex = ide_config.get("include_codex", False)
+        include_copilot = ide_config.get("include_copilot", False)
         
-        # Detectar si estamos en Docker
         docker_mode = os.environ.get("DOCKER_MODE") == "1"
-        appdata_override = os.environ.get("APPDATA_OVERRIDE")
-        
-        if docker_mode and appdata_override:
-            # En Docker: usar rutas montadas (nombres en minúsculas)
-            appdata = Path(appdata_override)
-            folder_map = {
-                "Code - Insiders": "code-insiders",
-                "Code": "code",
-            }
-            variants = []
-            for folder in ide_folders:
-                docker_folder = folder_map.get(folder, folder.lower())
-                variants.append(appdata / docker_folder / "workspaceStorage")
-            logger.info(f"[Docker] Buscando en: {appdata} para {ide_folders}")
-        else:
-            # En Windows/host normal
-            appdata = Path(os.environ.get("APPDATA", ""))
-            userprofile = Path(os.environ.get("USERPROFILE", ""))
-            variants = []
-            for folder in ide_folders:
-                variants.append(appdata / folder / "User" / "workspaceStorage")
+        variants = get_workspace_storage_roots(ide_folders)
         
         # VS Code / VS Code Insiders
         for variant in variants:
@@ -535,16 +609,13 @@ class CopilotChatWatcher:
         
         # globalStorage para sesiones sin workspace (solo en host, solo VS Code)
         if not docker_mode:
-            for folder in ide_folders:
-                if folder in ["Code - Insiders", "Code"]:
-                    empty_sessions = appdata / folder / "User" / "globalStorage" / "emptyWindowChatSessions"
-                    if empty_sessions.exists():
-                        dirs.append(empty_sessions)
+            for empty_sessions in get_empty_window_chat_roots(ide_folders):
+                if empty_sessions.exists():
+                    dirs.append(empty_sessions)
             
             # Cursor: ubicación diferente (~/.cursor/projects/*/agent-transcripts/)
             if include_cursor:
-                userprofile = Path(os.environ.get("USERPROFILE", ""))
-                cursor_projects = userprofile / ".cursor" / "projects"
+                cursor_projects = get_cursor_projects_dir()
                 if cursor_projects.exists():
                     for project_dir in cursor_projects.iterdir():
                         if project_dir.is_dir():
@@ -557,14 +628,14 @@ class CopilotChatWatcher:
             
             # Kiro: %APPDATA%\Kiro\User\History\*\
             if include_kiro:
-                kiro_history = appdata / "Kiro" / "User" / "History"
+                kiro_history = get_kiro_history_dir()
                 if kiro_history.exists():
                     for session_dir in kiro_history.iterdir():
                         if session_dir.is_dir():
                             dirs.append(session_dir)
 
             if include_codex:
-                codex_sessions = userprofile / ".codex" / "sessions"
+                codex_sessions = get_codex_sessions_dir()
                 if codex_sessions.exists():
                     for year_dir in codex_sessions.iterdir():
                         if not year_dir.is_dir():
@@ -575,6 +646,13 @@ class CopilotChatWatcher:
                             for day_dir in month_dir.iterdir():
                                 if day_dir.is_dir():
                                     dirs.append(day_dir)
+
+            if include_copilot:
+                copilot_sessions = get_copilot_session_state_dir()
+                if copilot_sessions.exists():
+                    for session_dir in copilot_sessions.iterdir():
+                        if session_dir.is_dir():
+                            dirs.append(session_dir)
         
         return dirs
     
@@ -640,7 +718,7 @@ class CopilotChatWatcher:
                     logger.error(f"[Kiro] Error cargando sesión: {e}")
         
         # Cargar sesión de VS Code/Cursor (JSONL)
-        recent_file = find_most_recent_session_file(self.ide_filter)
+        recent_file = self.get_selected_session_file()
         if not recent_file or not self.handler:
             return
 
@@ -704,7 +782,7 @@ class CopilotChatWatcher:
                 if include_kiro and self.ide_filter in ["kiro", "all"]:
                     self._poll_kiro_sessions()
                 
-                recent_file = find_most_recent_session_file(self.ide_filter)
+                recent_file = self.get_selected_session_file()
                 if recent_file and self.handler:
                     # FORZAR lectura real del archivo - invalidar cache de Windows
                     # Leer los últimos bytes del archivo para detectar cambios reales
@@ -894,7 +972,7 @@ class CopilotChatWatcher:
                 self._poll_last_hash = ""
                 logger.info(f"[POLL] IDE cambió, reiniciando tracking para: {self.ide_filter}")
             
-            recent_file = find_most_recent_session_file(self.ide_filter)
+            recent_file = self.get_selected_session_file()
             if not recent_file:
                 return False
             

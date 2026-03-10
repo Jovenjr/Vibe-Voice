@@ -1,224 +1,227 @@
-﻿# Vibe Voice
+# Vibe Voice
 
 ![CI](https://github.com/Jovenjr/Vibe-Voice/actions/workflows/ci.yml/badge.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)
-Vibe Voice es una app local para visualizar en tiempo real respuestas de asistentes dentro de tu entorno de desarrollo y, además, ofrece utilidades opcionales de voz como TTS y dictado con Whisper.
 
-El proyecto incluye:
+Vibe Voice convierte tus sesiones de coding assistants en una experiencia de **vibe coding conversacional**: puedes ver en vivo lo que el agente responde, escuchar su salida por voz, transcribir tu voz y operar sesiones a distancia desde la web o Telegram (segun configuracion).
 
-- un servidor WebSocket que observa sesiones locales compatibles
-- una interfaz web ligera para ver mensajes en vivo
-- TTS opcional para leer respuestas
-- una mini app de dictado de escritorio para Windows
+## Tabla de contenidos
 
-## Qué hace
+- [Proposito del proyecto](#proposito-del-proyecto)
+- [Features de valor](#features-de-valor)
+- [Quick start](#quick-start)
+- [Instalacion](#instalacion)
+- [Uso](#uso)
+- [Control remoto y voz](#control-remoto-y-voz)
+- [Compatibilidad](#compatibilidad)
+- [Configuracion](#configuracion)
+- [Seguridad, clausulas y advertencias](#seguridad-clausulas-y-advertencias)
+- [Despliegue remoto seguro](#despliegue-remoto-seguro)
+- [Estructura del proyecto](#estructura-del-proyecto)
+- [Contribuir](#contribuir)
+- [Licencia](#licencia)
 
-- Monitorea sesiones locales de chat compatibles
-- Muestra mensajes y respuestas en vivo en la UI web
-- Permite filtrar por IDE/editor soportado
-- Puede leer respuestas con TTS
-- Incluye dictado local con `Whisper`, `Groq` u `OpenAI`
+## Proposito del proyecto
 
-## Novedades recientes (UI)
+Vibe Voice nace para resolver este flujo:
 
-- `📌 Fijar` en la cabecera del chat para mantener una sesión seleccionada sin que otra actividad la cambie.
-- `🔈 Activar audio` para desbloquear reproducción del navegador cuando el autoplay está bloqueado.
-- Control de volumen local con icono dinámico (`🔇`/`🔈`/`🔉`/`🔊`) y `mute/unmute` con un clic.
+1. Tu agente de codificacion trabaja.
+2. Tu quieres **ver y escuchar** en tiempo real que esta pasando (respuesta, actividad, herramientas, progreso).
+3. Tu quieres poder **interactuar por voz** y tambien operar sesiones de forma remota cuando no estas frente al IDE.
 
-## Compatibilidad
+En resumen: menos friccion para iterar, mas contexto en vivo y mas control operativo.
 
-| Área | Soporte |
-| --- | --- |
-| Sistemas operativos | Linux y Windows |
-| IDE/sesiones observables | `codex`, `copilot`, `cursor`, `kiro`, `vscode`, `vscode-insiders`, `all` |
-| UI web | Navegadores modernos con WebSocket (`/ws`) |
-| TTS remoto | Sí, vía audio en navegador (recomendado para despliegue remoto) |
-| Dictado escritorio | Windows (`desktop_dictation.pyw`) |
-| Bridge de pegado local | Windows (`desktop_paste_bridge.pyw`, `run_paste_bridge.bat`) |
+## Features de valor
 
-## Estructura
+- Monitoreo en vivo de sesiones locales de `codex`, `copilot`, `cursor`, `kiro`, `vscode`, `vscode-insiders`.
+- Timeline de chat en la UI web con estado de actividad del agente (pensando, ejecutando herramienta, esperando confirmacion, etc.).
+- Historial persistente en SQLite con busqueda, exportacion y archivado de sesiones.
+- Pin de sesion (`📌 Fijar`) para mantener foco sin que otra actividad te cambie la vista.
+- TTS server-side con reproduccion remota en navegador:
+  - `Activar TTS`: genera voz nueva en backend.
+  - `Activar audio`: desbloquea autoplay del navegador.
+  - Volumen con icono dinamico (`🔇/🔈/🔉/🔊`) y mute/unmute.
+- STT multi-proveedor (Whisper local, Groq, Gemini, Google Cloud), via WebSocket y via `POST /api/stt`.
+- Entrada remota por Telegram (texto o voz) para transcribir/pegar en el entorno local.
+- Bridge local de pegado en Windows (`desktop_paste_bridge.pyw`) con hotkey global `F8`.
+- Secretos de configuracion persistidos con cifrado (settings sensibles en DB).
 
-```text
-server/   backend, watchers, WebSocket y TTS
-ui/       interfaz web estática
-docs/     documentación adicional
-```
-
-## Requisitos
-
-- Python 3.11+
-- Linux y Windows soportados para el watcher principal
-- El dictado de escritorio sigue siendo solo para Windows
-- `ffmpeg` en el `PATH` si vas a usar dictado
-
-## Instalación rápida
-
-### 1) Clona el repositorio
+## Quick start
 
 ```bash
 git clone https://github.com/Jovenjr/Vibe-Voice.git
 cd Vibe-Voice
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r server/requirements.txt
+python server/main.py --host 127.0.0.1 --ui-host 127.0.0.1 --ide all
 ```
 
-### 2) Crea un entorno virtual
+Luego abre `http://127.0.0.1:8080`.
+
+## Instalacion
+
+### Requisitos
+
+- Python 3.11+
+- `ffmpeg` en `PATH` si usas dictado/STT local
+- Windows para utilidades de escritorio (`desktop_dictation.pyw`, `desktop_paste_bridge.pyw`)
+
+### Pasos
 
 Linux:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-```
-
-Windows:
-
-```bash
-python -m venv .venv
-.venv\Scripts\activate
-```
-
-### 3) Instala dependencias del servidor
-
-```bash
-cd server
-pip install -r requirements.txt
-cd ..
-```
-
-### 4) Configura variables opcionales
-
-Linux:
-
-```bash
+pip install -r server/requirements.txt
 cp .env.example .env
 ```
 
 Windows:
 
-```bash
+```bat
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r server\requirements.txt
 copy .env.example .env
 ```
 
-## Ejecutar
+## Uso
 
 ### Servidor principal
 
 ```bash
-cd server
-python main.py
+python server/main.py
 ```
 
-Luego abre:
-
-- `http://localhost:8080`
-
-Opciones útiles:
+Flags utiles:
 
 ```bash
-python main.py --host 0.0.0.0 --port 8765 --ui-port 8080
-python main.py --host 127.0.0.1 --ui-host 127.0.0.1 --ide all
-python main.py --ide vscode
-python main.py --ide cursor
-python main.py --ide kiro
-python main.py --ide codex
-python main.py --ide copilot
+python server/main.py --host 127.0.0.1 --ui-host 127.0.0.1 --ide all
+python server/main.py --ide codex
+python server/main.py --ide copilot
+python server/main.py --ide cursor
+python server/main.py --ide kiro
+python server/main.py --ide vscode
 ```
 
-### Linux + Codex CLI
-
-Si lo quieres arrancar directamente contra las sesiones locales de Codex CLI:
+### Script Linux para Codex CLI
 
 ```bash
 ./run_codex_linux.sh
 ```
 
-Este script lee sesiones desde `~/.codex/sessions`.
+### UI web (flujo sugerido)
 
-### Bridge de pegado local (Windows)
+1. Abre sesion desde la barra izquierda.
+2. Usa `📌 Fijar` para mantener contexto.
+3. Activa TTS si quieres narracion.
+4. Si el navegador bloquea autoplay, pulsa `🔈 Activar audio`.
+5. Ajusta volumen o silencia con el icono de parlante.
 
-Para pegar transcripciones en la ventana activa con `Ctrl+V`:
+## Control remoto y voz
+
+### Telegram input (control remoto)
+
+Cuando esta habilitado, Vibe Voice puede recibir mensajes (texto/voz) del chat autorizado y convertirlos en entrada util para tu flujo local.
+
+### Bridge local de pegado (Windows)
+
+Iniciar bridge:
 
 ```bat
 run_paste_bridge.bat
 ```
 
-Para detener el bridge:
+Detener bridge:
 
 ```bat
 stop_paste_bridge.bat
 ```
 
-## Uso de la UI (rápido)
+Este bridge escucha en `ws://127.0.0.1:8766` y usa `Ctrl+V` en la ventana activa (localhost solamente).
 
-- Usa el filtro `IDE` para ver solo sesiones de una fuente.
-- En historial, abre una sesión y pulsa `📌 Fijar` para mantenerla como foco principal.
-- `Activar TTS` controla si se genera voz nueva en backend.
-- `Activar audio` solo desbloquea la reproducción en el navegador.
-- Ajusta `Volumen` o usa el icono de parlante para `mute/unmute`.
+## Compatibilidad
+
+| Area | Soporte |
+| --- | --- |
+| Sistemas operativos | Linux y Windows |
+| IDE/sesiones observables | `all`, `codex`, `copilot`, `cursor`, `kiro`, `vscode`, `vscode-insiders` |
+| UI web | Navegadores modernos con WebSocket |
+| Audio remoto | Si (reproduccion en navegador) |
+| Dictado desktop | Windows |
+| Bridge local de pegado | Windows |
+
+## Configuracion
+
+Variables relevantes en `.env`:
+
+- `GEMINI_API_KEY`, `GEMINI_MODEL`
+- `GROQ_API_KEY`
+- `OPENAI_API_KEY`, `OPENAI_AUDIO_MODEL`
+- `DICTATION_PROVIDER`
+- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
+- `STT_PROVIDER`, `WHISPER_MODEL`
+
+Variables operativas utiles:
+
+- `CODEX_SESSIONS_OVERRIDE`
+- `COPILOT_SESSIONS_OVERRIDE`
+- `TTS_BROWSER_PLAYBACK`
+- `VIBE_VOICE_SETTINGS_KEY` (clave de cifrado para settings sensibles)
+- `VIBE_VOICE_BRIDGE_HOST`, `VIBE_VOICE_BRIDGE_PORT`, `VIBE_VOICE_BRIDGE_SEND_ENTER`, `VIBE_VOICE_BRIDGE_NAME`
+
+## Seguridad, clausulas y advertencias
+
+> **Clausula de uso responsable:** al activar canales remotos (web publica, Telegram input, bridge de pegado), estas habilitando control indirecto de flujo de trabajo local. Debe usarse solo en entornos confiables y con controles de acceso.
+
+Advertencias importantes:
+
+- No expongas `:8080` ni `:8765` directamente a Internet.
+- Usa siempre proxy HTTPS + allowlist IP/CIDR para acceso remoto.
+- Nunca publiques `.env`, tokens, rutas privadas ni datos de sesiones reales.
+- Protege `TELEGRAM_BOT_TOKEN` como credencial critica.
+- Si habilitas Telegram input, limita estrictamente `TELEGRAM_CHAT_ID`.
+- El bridge de pegado debe permanecer en localhost; no lo tunnels ni publiques.
+- Revisa `SECURITY.md` y `docs/SECURE_REMOTE_ACCESS.md` antes de desplegar.
 
 ## Despliegue remoto seguro
 
-Para publicar de forma segura:
+Resumen:
 
-1. Ejecuta el backend/UI solo en loopback (`127.0.0.1`).
-2. Expón el servicio con un proxy HTTPS (Nginx) y `/ws` para WebSocket.
+1. Ejecuta backend/UI en loopback (`127.0.0.1`).
+2. Publica via Nginx (HTTPS) con proxy para `/` y `/ws`.
 3. Restringe acceso por IP/CIDR en proxy y firewall.
 
-Referencia completa:
+Guia y template:
 
 - `docs/SECURE_REMOTE_ACCESS.md`
 - `deploy/nginx/vibe-voice.conf`
 
-### Lanzador oculto en Windows
+## Estructura del proyecto
 
-```bash
-pythonw run_hidden.pyw
+```text
+server/                   backend, parser, watcher, DB, TTS/STT
+ui/                       app web (historial, controles de sesion y audio)
+deploy/nginx/             template de reverse proxy seguro
+docs/                     guias de integracion y despliegue
+desktop_dictation.pyw     app de dictado local (Windows)
+desktop_paste_bridge.pyw  bridge local para pegar texto remoto (Windows)
+run_codex_linux.sh        launcher Linux orientado a sesiones Codex
+run_paste_bridge.bat      inicia bridge de pegado en Windows
+stop_paste_bridge.bat     detiene bridge de pegado en Windows
 ```
 
-### Dictado local
+## Contribuir
 
-```bash
-pythonw desktop_dictation.pyw
-```
+1. Fork del repo.
+2. Crea rama: `git checkout -b feat/mi-cambio`.
+3. Haz commits pequenos y claros.
+4. Ejecuta chequeos de sintaxis/funcionamiento.
+5. Abre Pull Request con contexto tecnico y validacion.
 
-## Variables de entorno
+## Licencia
 
-Revisa `.env.example`. Las más importantes son:
-
-- `GEMINI_API_KEY`
-- `GEMINI_MODEL`
-- `OPENAI_API_KEY`
-- `OPENAI_AUDIO_MODEL`
-- `GROQ_API_KEY`
-- `GROQ_AUDIO_MODEL`
-- `DICTATION_PROVIDER`
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
-
-## Checklist antes de push a repositorio público
-
-Antes de hacer `git push`:
-
-1. Revisa `git status` y confirma que no entren archivos locales/runtime.
-2. No subas `.env`, credenciales reales ni tokens.
-3. Mantén `deploy/nginx/vibe-voice.conf` con valores de ejemplo (sin IP real).
-4. Verifica que `data/`, `audio_cache/`, logs y DB locales sigan ignorados.
-5. Si cambias UI/flujo, actualiza este README y los docs relacionados.
-
-El `.gitignore` ya cubre artefactos comunes (`.env`, `*.log`, `*.db`, `data/`, `audio_cache/`).
-
-## Notas
-
-- Este proyecto está pensado para correr localmente y leer sesiones locales del usuario.
-- Algunas integraciones dependen del sistema operativo y de cómo cada editor guarda sus sesiones.
-- Las funciones de TTS, Telegram y dictado son opcionales.
-- En Linux, VS Code se busca en `~/.config/Code` y Codex CLI en `~/.codex/sessions`.
-
-## Repositorio público
-
-- `https://github.com/Jovenjr/Vibe-Voice`
-
-## GitHub setup
-
-Suggested GitHub metadata is available in .github/REPO_METADATA.md.
-Initial public release notes are available in .github/RELEASE_v0.1.0.md.
+MIT. Ver [LICENSE](LICENSE).

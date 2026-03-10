@@ -11,18 +11,19 @@ Luego haz una pregunta en VS Code Copilot y observa si este script
 detecta el cambio ANTES de que hagas clic en cualquier ventana.
 """
 
-import os
 import sys
 import time
 import hashlib
 from pathlib import Path
 
+from platform_paths import get_workspace_storage_roots
+
 # Buscar el archivo más reciente de VS Code
 def find_vscode_file():
-    appdata = Path(os.environ.get("APPDATA", ""))
-    
-    for folder in ["Code - Insiders", "Code"]:
-        ws_storage = appdata / folder / "User" / "workspaceStorage"
+    for folder, ws_storage in zip(
+        ["Code - Insiders", "Code"],
+        get_workspace_storage_roots(["Code - Insiders", "Code"]),
+    ):
         if not ws_storage.exists():
             continue
         
