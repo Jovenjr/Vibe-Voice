@@ -20,6 +20,8 @@
     </div>
     <div class="topbar-right">
       <span class="meta" title="Latencia">⚡ <span id="latency">–</span></span>
+      <span class="meta" title="Estado del agente">🤖 <span id="agent-state">sin señal</span></span>
+      <span class="meta file-meta" title="Actividad del agente">🛠 <span id="agent-detail">–</span></span>
       <span class="meta" title="Directorios monitoreados">📂 <span id="watching-count">–</span></span>
       <span class="meta file-meta" title="Sesión activa">🗂 <span id="active-file">ninguno</span></span>
       <button id="force-refresh-btn" class="btn-icon" title="Forzar actualización">🔄</button>
@@ -30,8 +32,56 @@
   </header>
 
   <div class="layout">
+    <aside class="session-sidebar">
+      <section class="card session-browser">
+        <div class="session-browser-head">
+          <div>
+            <h3 class="card-title">Sesiones</h3>
+            <p class="hint">Filtra por estado o busca por proyecto, carpeta, rama y modelo</p>
+          </div>
+          <button id="follow-latest" class="btn-small btn-latest" title="Volver a la sesión más reciente">🕒 Reciente</button>
+        </div>
+
+        <div class="session-tabs" role="tablist" aria-label="Vista de sesiones">
+          <button id="sessions-view-active" class="btn-small session-tab active" data-session-view="active" type="button" aria-pressed="true">Activas</button>
+          <button id="sessions-view-archived" class="btn-small session-tab" data-session-view="archived" type="button" aria-pressed="false">Archivadas</button>
+        </div>
+
+        <div class="session-filters" role="toolbar" aria-label="Filtros de sesiones">
+          <button class="btn-small session-filter active" data-session-filter="all" type="button" aria-pressed="true">Todas</button>
+          <button class="btn-small session-filter" data-session-filter="active" type="button" aria-pressed="false">Solo activas</button>
+          <button class="btn-small session-filter" data-session-filter="waiting" type="button" aria-pressed="false">Esperando</button>
+          <button class="btn-small session-filter" data-session-filter="error" type="button" aria-pressed="false">Errores</button>
+        </div>
+
+        <div class="search-box">
+          <input id="history-search" type="text" class="input" placeholder="Buscar proyecto, carpeta, rama o modelo..." />
+          <button id="search-btn" class="btn-icon" title="Buscar texto dentro de mensajes">🔎</button>
+          <button id="clear-search-btn" class="btn-icon" title="Limpiar filtro">✕</button>
+        </div>
+
+        <div id="sessions-list" class="sessions-list sessions-list-rich">
+          <p class="hint">Cargando sesiones...</p>
+        </div>
+
+        <div class="db-stats">
+          <span id="db-stats-text" class="hint">Sesiones: - | Mensajes: -</span>
+        </div>
+      </section>
+    </aside>
 
     <main class="chat-panel">
+      <div class="chat-session-head">
+        <div class="chat-session-main">
+          <div id="current-session-title" class="chat-session-title">Sin sesión seleccionada</div>
+          <div id="current-session-subtitle" class="chat-session-subtitle">Selecciona una sesión en la barra izquierda</div>
+        </div>
+        <div class="chat-session-actions">
+          <button id="pin-session-btn" class="btn-small" title="Fijar esta sesión para que no la reemplace otra actividad">📌 Fijar</button>
+          <button id="export-md" class="btn-small" title="Exportar Markdown">📄 MD</button>
+          <button id="export-json" class="btn-small" title="Exportar JSON">📋 JSON</button>
+        </div>
+      </div>
       <div id="messages" class="messages"></div>
     </main>
 
@@ -51,6 +101,7 @@
           <option value="vscode">VS Code</option>
           <option value="cursor">Cursor</option>
           <option value="codex">Codex CLI</option>
+          <option value="copilot">Copilot CLI</option>
         </select>
         <p class="hint" id="ide-hint">Selecciona qué IDE monitorear</p>
         
@@ -82,6 +133,19 @@
           <input id="tts-llm-enabled" type="checkbox" class="toggle" /><span class="track"></span>
         </label>
 
+        <div class="audio-browser-controls">
+          <button id="unlock-audio-btn" class="btn-small btn-audio-unlock" type="button" title="Desbloquear el audio del navegador remoto">🔈 Activar audio</button>
+        </div>
+        <p class="hint">`Activar TTS` genera voz nueva. `Activar audio` solo desbloquea el sonido del navegador.</p>
+
+        <div class="audio-volume-row">
+          <button id="audio-volume-icon" class="btn-icon audio-volume-icon" type="button" title="Silenciar audio del navegador" aria-label="Silenciar audio del navegador">🔊</button>
+          <div class="audio-volume-slider-wrap">
+            <label class="field-label" for="audio-volume">Volumen: <span id="audio-volume-label">100%</span></label>
+            <input id="audio-volume" type="range" min="0" max="1" step="0.05" value="1" class="slider" />
+          </div>
+        </div>
+
         <label class="toggle-row">
           <span>Enviar a Telegram</span>
           <input id="tts-telegram" type="checkbox" class="toggle" /><span class="track"></span>
@@ -104,6 +168,18 @@
       </section>
 
       <section class="card">
+        <h3 class="card-title">Dictado</h3>
+        <button id="stt-record" class="btn-primary" type="button">🎙 Empezar</button>
+        <p class="hint" id="stt-status">Usa el micrófono del navegador. La transcripción se copiará al portapapeles.</p>
+        <label class="toggle-row">
+          <span>Pegar con agente local</span>
+          <input id="stt-local-bridge" type="checkbox" class="toggle" /><span class="track"></span>
+        </label>
+        <p class="hint" id="local-bridge-status">Agente local desactivado.</p>
+        <p class="hint">En Windows: ejecuta <code>run_paste_bridge.bat</code> una vez. Usa <code>F8</code> para iniciar/detener y <code>stop_paste_bridge.bat</code> para cerrarlo.</p>
+      </section>
+
+      <section class="card">
         <h3 class="card-title">Vista</h3>
 
         <label class="toggle-row">
@@ -118,30 +194,6 @@
 
         <button id="clear-messages" class="btn-danger">🗑 Limpiar chat</button>
       </section>
-
-      <section class="card">
-        <h3 class="card-title">Historial</h3>
-        
-        <div class="search-box">
-          <input id="history-search" type="text" class="input" placeholder="Buscar en historial..." />
-          <button id="search-btn" class="btn-icon" title="Buscar">🔍</button>
-        </div>
-        
-        <div id="sessions-list" class="sessions-list">
-          <p class="hint">Cargando sesiones...</p>
-        </div>
-        
-        <div class="history-actions">
-          <button id="export-md" class="btn-small" title="Exportar Markdown">📄 MD</button>
-          <button id="export-json" class="btn-small" title="Exportar JSON">📋 JSON</button>
-          <button id="load-session" class="btn-small" title="Cargar sesión">📂 Cargar</button>
-        </div>
-        
-        <div class="db-stats">
-          <span id="db-stats-text" class="hint">Sesiones: - | Mensajes: -</span>
-        </div>
-      </section>
-
     </aside>
   </div>
 
@@ -182,6 +234,7 @@
               <option value="vscode">VS Code</option>
               <option value="vscode-insiders">VS Code Insiders</option>
               <option value="codex">Codex CLI</option>
+              <option value="copilot">Copilot CLI</option>
             </select>
           </div>
 
