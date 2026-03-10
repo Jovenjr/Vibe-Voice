@@ -1,6 +1,7 @@
 # Acceso remoto seguro para Vibe Voice
 
 Esta guia resume como exponer Vibe Voice minimizando riesgo.
+Asume que ya validaste modo local-first (ver [`INSTALL_LOCAL.md`](INSTALL_LOCAL.md) y [`OPERATIONS.md`](OPERATIONS.md)).
 
 ## Clausula de seguridad y uso responsable
 
@@ -23,15 +24,21 @@ Usalo solo en equipos y redes confiables, con controles de acceso estrictos y cr
 
 ## Arranque recomendado
 
-Modo general (todos los IDE soportados):
+Modo general (todos los IDE soportados, via script unificado):
 
 ```bash
 cd /opt/Vibe-Voice
-source .venv/bin/activate
+VIBE_VOICE_HOST=127.0.0.1 VIBE_VOICE_UI_HOST=127.0.0.1 VIBE_VOICE_IDE=all ./start_server.sh
+./status_server.sh
+```
+
+Modo manual (avanzado, equivalente):
+
+```bash
 python server/main.py --host 127.0.0.1 --ui-host 127.0.0.1 --ide all
 ```
 
-Modo Codex CLI rapido:
+Modo Codex CLI rapido (avanzado):
 
 ```bash
 ./run_codex_linux.sh --host 127.0.0.1 --ui-host 127.0.0.1

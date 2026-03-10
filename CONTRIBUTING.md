@@ -11,11 +11,34 @@ Gracias por tu interés en contribuir a `Vibe Voice`.
 
 ## Entorno local
 
+Linux:
+
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r server/requirements.txt
+```
+
+Windows:
+
+```bat
 python -m venv .venv
 .venv\Scripts\activate
-cd server
-pip install -r requirements.txt
+pip install -r server\requirements.txt
+```
+
+Chequeo rapido recomendado:
+
+Linux:
+
+```bash
+./doctor.sh
+```
+
+Windows:
+
+```bat
+doctor.bat
 ```
 
 ## Estilo general
@@ -38,6 +61,12 @@ for path in Path('server').glob('*.py'):
     ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
 print('OK')
 PY
+```
+
+Y para UI:
+
+```bash
+node --check ui/app.js
 ```
 
 ## Pull requests

@@ -9,15 +9,19 @@ Vibe Voice convierte tus sesiones de coding assistants en una experiencia de **v
 ## Tabla de contenidos
 
 - [Proposito del proyecto](#proposito-del-proyecto)
+- [Modos de uso oficiales](#modos-de-uso-oficiales)
 - [Features de valor](#features-de-valor)
 - [Quick start](#quick-start)
 - [Instalacion](#instalacion)
 - [Uso](#uso)
 - [Control remoto y voz](#control-remoto-y-voz)
+- [Guias por escenario](#guias-por-escenario)
 - [Compatibilidad](#compatibilidad)
 - [Configuracion](#configuracion)
 - [Seguridad, clausulas y advertencias](#seguridad-clausulas-y-advertencias)
 - [Despliegue remoto seguro](#despliegue-remoto-seguro)
+- [Comandos operativos unificados](#comandos-operativos-unificados)
+- [Roadmap](#roadmap)
 - [Estructura del proyecto](#estructura-del-proyecto)
 - [Contribuir](#contribuir)
 - [Licencia](#licencia)
@@ -31,6 +35,13 @@ Vibe Voice nace para resolver este flujo:
 3. Tu quieres poder **interactuar por voz** y tambien operar sesiones de forma remota cuando no estas frente al IDE.
 
 En resumen: menos friccion para iterar, mas contexto en vivo y mas control operativo.
+
+## Modos de uso oficiales
+
+- **Modo Local (recomendado):** todo corre en tu maquina, sin exponer puertos.
+- **Modo Remoto/VPS (avanzado):** acceso via web publica detras de HTTPS reverse proxy, con allowlist y hardening.
+
+El producto se optimiza primero para `Modo Local`, y el uso remoto requiere controles de seguridad explicitos.
 
 ## Features de valor
 
@@ -55,7 +66,8 @@ cd Vibe-Voice
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r server/requirements.txt
-python server/main.py --host 127.0.0.1 --ui-host 127.0.0.1 --ide all
+./doctor.sh
+./start_server.sh
 ```
 
 Luego abre `http://127.0.0.1:8080`.
@@ -90,7 +102,29 @@ copy .env.example .env
 
 ## Uso
 
-### Servidor principal
+Para P0 local-first, usa primero los scripts unificados (`start/status/stop/doctor`). El arranque manual con `python server/main.py` queda como opcion avanzada.
+
+### Operacion unificada recomendada
+
+Linux:
+
+```bash
+./start_server.sh
+./status_server.sh
+./stop_server.sh
+./doctor.sh
+```
+
+Windows:
+
+```bat
+start_server.bat
+status_server.bat
+stop_server.bat
+doctor.bat
+```
+
+### Servidor principal (modo manual/avanzado)
 
 ```bash
 python server/main.py
@@ -123,6 +157,8 @@ python server/main.py --ide vscode
 
 ## Control remoto y voz
 
+Las funciones remotas son modo avanzado: primero valida instalacion y operacion local.
+
 ### Telegram input (control remoto)
 
 Cuando esta habilitado, Vibe Voice puede recibir mensajes (texto/voz) del chat autorizado y convertirlos en entrada util para tu flujo local.
@@ -142,6 +178,15 @@ stop_paste_bridge.bat
 ```
 
 Este bridge escucha en `ws://127.0.0.1:8766` y usa `Ctrl+V` en la ventana activa (localhost solamente).
+
+## Guias por escenario
+
+- Instalacion local: [`docs/INSTALL_LOCAL.md`](docs/INSTALL_LOCAL.md)
+- Operacion diaria: [`docs/OPERATIONS.md`](docs/OPERATIONS.md)
+- Control remoto: [`docs/REMOTE_CONTROL.md`](docs/REMOTE_CONTROL.md)
+- Acceso remoto seguro: [`docs/SECURE_REMOTE_ACCESS.md`](docs/SECURE_REMOTE_ACCESS.md)
+- Smoke tests: [`docs/SMOKE_TEST_MATRIX.md`](docs/SMOKE_TEST_MATRIX.md)
+- Roadmap de producto: [`docs/PRODUCT_ROADMAP.md`](docs/PRODUCT_ROADMAP.md)
 
 ## Compatibilidad
 
@@ -199,6 +244,21 @@ Guia y template:
 
 - `docs/SECURE_REMOTE_ACCESS.md`
 - `deploy/nginx/vibe-voice.conf`
+
+## Comandos operativos unificados
+
+| Objetivo | Linux | Windows |
+| --- | --- | --- |
+| Iniciar | `./start_server.sh` | `start_server.bat` |
+| Estado | `./status_server.sh` | `status_server.bat` |
+| Detener | `./stop_server.sh` | `stop_server.bat` |
+| Verificar entorno | `./doctor.sh` | `doctor.bat` |
+
+## Roadmap
+
+- Estado actual (P0): producto local-first usable + remoto avanzado documentado.
+- Siguiente etapa (P1): auth remota nativa + onboarding guiado.
+- Detalle: [`docs/PRODUCT_ROADMAP.md`](docs/PRODUCT_ROADMAP.md)
 
 ## Estructura del proyecto
 

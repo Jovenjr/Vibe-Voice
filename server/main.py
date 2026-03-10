@@ -18,6 +18,7 @@ import base64
 import json
 import argparse
 import logging
+import ipaddress
 import sys
 import threading
 import http.server
@@ -151,6 +152,16 @@ logging.basicConfig(
     force=True
 )
 logger = logging.getLogger(__name__)
+
+
+def _is_loopback_host(host: str) -> bool:
+    host = (host or "").strip().lower()
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 class CopilotWebSocketServer:
     """Servidor WebSocket para transmitir eventos de chat en tiempo real."""
@@ -1207,13 +1218,15 @@ def start_http_server(host: str, port: int, directory: Path, audio_dir: Path = N
         def do_GET(self):
             # Servir archivos de audio desde /audio/
             if self.path.startswith('/audio/') and audio_dir:
+                if not self._origin_allowed():
+                    self.send_error(403, "Origin not allowed")
+                    return
                 filename = self.path[7:]  # Quitar '/audio/'
                 audio_file = audio_dir / filename
                 if audio_file.exists() and audio_file.suffix == '.mp3':
                     self.send_response(200)
                     self.send_header('Content-Type', 'audio/mpeg')
                     self.send_header('Content-Length', audio_file.stat().st_size)
-                    self.send_header('Access-Control-Allow-Origin', '*')
                     self.end_headers()
                     with open(audio_file, 'rb') as f:
                         self.wfile.write(f.read())
@@ -1320,6 +1333,13 @@ async def main():
     parser.add_argument("--llm-model", default=None, help="Modelo Gemini para procesar TTS (usa GEMINI_MODEL del .env)")
     parser.add_argument("--ide", default="all", help="IDE a monitorear: all, vscode, vscode-insiders, cursor, kiro, codex, copilot")
     args = parser.parse_args()
+
+    if not _is_loopback_host(args.host) or not _is_loopback_host(args.ui_host):
+        logger.warning(
+            "[SECURITY] Ejecutando fuera de loopback "
+            f"(host={args.host}, ui-host={args.ui_host}). "
+            "Usa reverse proxy HTTPS, allowlist y autenticación adicional."
+        )
     
     # Directorio de la UI (relativo al script)
     ui_dir = Path(__file__).parent.parent / "ui"
